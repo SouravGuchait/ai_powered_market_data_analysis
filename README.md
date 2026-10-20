@@ -2,10 +2,11 @@ AI Powered Backend Application
 
 Market-data backend: Django + Django REST Framework, MySQL, Celery/Redis, and
 Pandas for processing. Current state: custom email/username user model and JWT
-authentication, plus the market-data ORM schema (ingestion jobs, files,
+authentication, the market-data ORM schema (ingestion jobs, files,
 exchanges/instruments, daily price records, validation issues, audit events,
-metric snapshots) with a synthetic-data generator. Upload endpoints,
-ingestion, processing, and analytics are not implemented yet.
+metric snapshots), a synthetic-data generator, and the upload API with durable
+job records and owner-scoped status. Ingestion processing, metrics, and
+analytics are not implemented yet.
 
 ## Requirements
 
@@ -89,6 +90,7 @@ local fallback. Host-provided variables win over `.env`.
 | `SERVE_API_DOCS` | DEBUG | Serves `/api/schema/` and `/api/docs/` |
 | `DJANGO_MEDIA_ROOT` | `media` | Filesystem media storage |
 | `DJANGO_STATIC_ROOT` | `staticfiles` | `collectstatic` target |
+| `MAX_UPLOAD_SIZE_BYTES` | `52428800` (50 MiB) | Streamed upload limit; larger requests get `413`. Size columns are 64-bit, so raising it needs no migration |
 
 Invalid configuration raises `ImproperlyConfigured` at import. There is no
 silent fallback to SQLite, a default secret, or an empty allowed-host list.
@@ -204,6 +206,115 @@ loads the WSGI application, so the tables are created or updated before the
 server starts listening. Set `AUTO_MIGRATE=False` and run `manage.py migrate` as
 a release step to keep application processes read-only against the schema.
 
+## Uploads and jobs (milestone 04)
+
+`POST /api/v1/uploads/` accepts one CSV, JSON, or XLSX file, records an
+`IngestionJob` plus `IngestionFile`, and queues the job after the transaction
+commits. `GET /api/v1/jobs/{uuid}/` returns status and row counts to the owning
+user only. Processing itself is milestone 05.
+
+| Method | Path | Access | Notes |
+| --- | --- | --- | --- |
+| `POST` | `/api/v1/uploads/` | Bearer access token | Multipart file or raw body; `202 Accepted` |
+| `GET` | `/api/v1/jobs/{uuid}/` | Bearer access token, owner only | `200`; another user gets `404` |
+
+### Request formats
+
+- Multipart: one file in the `file` field. Send `Idempotency-Key` as a header
+  or `idempotency_key` as a form field, not both with different values.
+- Raw: send the bytes as the request body with `Content-Type: text/csv`,
+  `application/json`, or the XLSX MIME type. Raw `text/plain` and
+  `application/octet-stream` bodies require an `X-Filename` header.
+- Extensions `.csv`, `.json`, and `.xlsx` are required. Extension and MIME type
+  are hints; the first 64 KiB are checked before a job is created. CSV/JSON must
+  be UTF-8 (a UTF-8 BOM is accepted).
+- CSV header must contain `symbol`, `timestamp`, `open`, `high`, `low`, `close`,
+  and `volume`; extra columns are allowed. JSON must start with `[` or `{`.
+  XLSX must start with the ZIP signature.
+- Files are streamed to storage in 64 KiB chunks. `MAX_UPLOAD_SIZE_BYTES`
+  bounds the body. No full-file row parsing happens inside the request.
+
+Successful response:
+
+```json
+{"id": "4e55b7a0-5e6c-4b12-9e57-0e5f4f3c4a11", "status": "queued", "replayed": false}
+```
+
+The response also sets `Location` to the job detail path. `202` means the job
+was recorded and handed to the queue; it does not mean processing finished.
+
+Errors are stable and do not include local paths or traces:
+
+```json
+{"error": {"code": "missing_columns", "message": "CSV header is missing required columns: open, high."}}
+```
+
+| Code | HTTP | Meaning |
+| --- | --- | --- |
+| `file_required`, `multiple_files` | `400` | No file, or more than one file |
+| `unsupported_file_type` | `415` | Extension is not csv/json/xlsx |
+| `unsupported_media_type`, `unsupported_charset` | `415` | MIME or declared charset is not accepted |
+| `filename_required` | `400` | Raw body cannot be typed without `X-Filename` |
+| `file_too_large` | `413` | Above `MAX_UPLOAD_SIZE_BYTES` |
+| `empty_file` | `400` | Zero bytes or no header content |
+| `missing_columns`, `invalid_file_content` | `400` | Header/content probe failed |
+| `invalid_idempotency_key`, `conflicting_idempotency_key` | `400` | Bad or inconsistent key |
+| `storage_error` | `503` | Storage backend failed; nothing was recorded |
+| `enqueue_failed` | `503` | Broker dispatch failed; the job and stored object were removed |
+| `persistence_error` | `503` | Database write failed; the stored object was removed |
+| `invalid_request` | `400` | Multipart/body could not be parsed |
+| `internal_error` | `500` | Unexpected request failure, details only in logs |
+
+### Idempotency and retries
+
+`Idempotency-Key` is optional, 1-64 characters (`A-Z`, `a-z`, `0-9`, `.`, `_`,
+`:`, `-`), and scoped to the owner. A repeat with the same owner and key returns
+the original job with `202` and `"replayed": true`; no second file or job is
+created. A different user may reuse the same key. Requests without a key are
+not deduplicated. After a failed or cancelled job, retry with a new key: the
+original key continues to resolve to the original job.
+
+### Storage and cleanup
+
+Storage keys are generated as
+`uploads/<user_id>/<job_id>/<random>.<extension>`. The uploaded filename is
+stored only as sanitized `IngestionFile.original_filename`; it never becomes a
+path. `storage_key` is not exposed by the API or the admin change form.
+
+The default backend is Django's local media storage (`DJANGO_MEDIA_ROOT`). The
+same calls use Django's storage interface, so an S3 backend that implements
+that interface can replace it without changing views. The stored object is kept
+for the worker and is deleted by ingestion cleanup in milestone 05. Files are
+deleted immediately when validation, storage, database persistence, or enqueue
+fails, and uploaded file handles are closed at the end of the request.
+
+### Dispatch and status
+
+The job is committed inside `transaction.atomic()`, and
+`transaction.on_commit` calls Celery for
+`apps.marketdata.tasks.process_ingestion_job` with only the job UUID. The task
+body belongs to milestone 05. If dispatch fails, the API returns `503`, deletes
+the job row and stored object, and does not return `202`.
+
+Job statuses are `queued -> running -> completed|failed|cancelled`; `running`
+is the processing state in DATA_MODEL.md. Transitions are enforced by
+`IngestionJob.assert_transition()` and terminal states are final. The detail
+response includes `id`, `status`, `source_type`, `rows_received`,
+`rows_accepted`, `rows_rejected`, `error_code`, `error_summary`, and timestamps.
+
+Example (PowerShell 7+ for `-Form`):
+
+```powershell
+$login = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/auth/login/ `
+  -ContentType application/json `
+  -Body '{"username":"owner","password":"CorrectHorseBatteryStaple9"}'
+$job = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/uploads/ `
+  -Headers @{ Authorization = "Bearer $($login.access)"; "Idempotency-Key" = "upload-1" } `
+  -Form @{ file = Get-Item .\sample_data\synthetic_market_clean.csv }
+Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:8000/api/v1/jobs/$($job.id)/" `
+  -Headers @{ Authorization = "Bearer $($login.access)" }
+```
+
 ## Data models (milestone 03)
 
 `apps/marketdata/models.py` implements the approved schema with database-level
@@ -224,8 +335,8 @@ precision, index justification) lives in `DATA_MODEL.md`.
   negative or exceed `rows_received` (DB checks). `idempotency_key` is
   optional but unique per owner. Job state lives in MySQL only.
 - `IngestionFile`: storage-relative `storage_key` (kept out of the admin and
-  the future API), lowercase SHA-256 `checksum`, size and content type. Files
-  live in configured storage, never in a database column.
+  the API), lowercase SHA-256 `checksum`, size and content type. Files live in
+  configured storage, never in a database column.
 - `ValidationIssue`: multiple issues per row allowed; indexed by job+row and
   job+error code. `raw_row` stays out of the admin change form.
 - `AuditEvent`: nullable user, stable action names, `GenericIPAddressField`,
@@ -268,9 +379,11 @@ by name, and the clean files are asserted corruption-free at generation time.
 ### Ownership
 
 `apps/accounts/permissions.py:IsOwner` allows an object only when
-`obj.owner_id == request.user.pk`. Upload-job endpoints, when added, must filter
-querysets by the requesting user and combine that with this permission. The
-cross-user denial case is covered by `apps/accounts/tests/test_permissions.py`.
+`obj.owner_id == request.user.pk`. The job detail endpoint filters
+`IngestionJob` by `created_by=request.user` and returns `404` for another user's
+job, so existence is not disclosed. The cross-user cases are covered by
+`apps/accounts/tests/test_permissions.py` and
+`apps/marketdata/tests/test_uploads.py`.
 
 ## Layout
 
@@ -280,8 +393,12 @@ cross-user denial case is covered by `apps/accounts/tests/test_permissions.py`.
 - `apps/accounts/` - custom user, manager, email-or-username backend, admin,
   serializers, JWT views, throttling scopes, owner permission, tests
 - `apps/accounts/tests/integration/` - auth flow, migration, and startup probes
-- `apps/marketdata/` - schema (models, migration, admin), tests; ingestion
-  processing and analytics come later
+- `apps/marketdata/` - schema (models, migration, admin), upload validation,
+  storage adapter, views, serializers, URLs, tests; ingestion processing and
+  analytics come later
+- `apps/marketdata/jobs/ingestion/` - queue dispatch after commit and cleanup
+  for unaccepted uploads
+- `apps/marketdata/tests/integration/` - real Celery broker connectivity probe
 - `scripts/generate_market_data.py` - deterministic synthetic OHLCV fixtures
 - `sample_data/` - optional local example output of the generator (not committed)
 - `manage.py` - command entrypoint
@@ -297,7 +414,8 @@ cross-user denial case is covered by `apps/accounts/tests/test_permissions.py`.
 .\venv\Scripts\python.exe -m pytest -q -m integration
 ```
 
-Integration tests live in `apps/accounts/tests/integration/`:
+Integration tests live in `apps/accounts/tests/integration/` and
+`apps/marketdata/tests/integration/`:
 
 - `test_auth_flow.py` drives register, login by username and email, `/me/`,
   refresh rotation, logout blacklisting, and CSRF-free API requests.
@@ -305,12 +423,21 @@ Integration tests live in `apps/accounts/tests/integration/`:
   `0002` against legacy `0001` rows and WSGI startup table creation. The probes
   use `probe_settings.py` and isolated SQLite files, so they do not touch the
   configured MySQL database.
+- `test_broker.py` checks a real Celery broker connection and skips when Redis
+  is unavailable.
 
 The rest of the suite covers registration and email normalization, duplicate
 username and email at the serializer and database layers, password validators,
 login with username and with email, JWT refresh and blacklist logout, the
 unauthenticated boundary, CSRF-free API POSTs, cross-user ownership denial,
-superuser/admin creation, and throttling for the credential endpoints.
+superuser/admin creation, throttling for the credential endpoints, market-data
+constraints, and upload behavior (multipart/raw formats, size and content
+probes, idempotent replay, owner scoping, post-commit dispatch, and failure
+cleanup).
+
+Run database-backed suites sequentially. Two pytest processes share the
+configured MySQL test database; starting them in parallel fails with an existing
+`django_migrations` table.
 
 ## Verification (milestone 02, run 2026-10-20, Python 3.12.0)
 
@@ -358,6 +485,27 @@ but are not pinned in `requirements-dev.txt`.
 Constraints verified only against MySQL 8 (`InnoDB`): unsigned counters and
 check constraints; other backends are not wired in this project.
 
+## Verification (milestone 04, run 2026-10-20, Python 3.12.0, Django 5.2.18)
+
+| Command | Result |
+| --- | --- |
+| `python manage.py check` | `System check identified no issues (0 silenced)` |
+| `python manage.py makemigrations --check --dry-run` | `No changes detected` |
+| `python manage.py migrate --noinput` | `Applying marketdata.0002_ingestionfile_size_bigint... OK` |
+| `pytest -q` with the MySQL test database | `101 passed` (24 upload tests, 1 size test, 1 broker integration test) |
+| `pytest -q -m "not integration"` | `97 passed, 4 deselected` |
+| `pytest -q -m integration` | `4 passed, 97 deselected` |
+| `ruff check apps config scripts manage.py` | `All checks passed!` |
+| `python manage.py spectacular --file <temp>` | exit 0, schema generated |
+| Real Celery broker connection through `CELERY_BROKER_URL` | Redis was available; integration test passed |
+
+The upload tests mock Celery dispatch, use a temporary local storage backend,
+and cover missing files, wrong extension, mismatched MIME, oversized
+and empty files, malformed headers/JSON/XLSX, non-UTF-8 CSV, unauthenticated
+access, cross-user job access, post-commit dispatch, storage and enqueue
+failures, duplicate idempotency keys, owner-scoped keys, and path-traversal
+filenames. No live market API is used.
+
 ## Known limitations
 
 - No password-reset endpoint (no email transport configured).
@@ -376,13 +524,29 @@ check constraints; other backends are not wired in this project.
   annotation warnings for untyped DRF and Django class attributes. Its
   `reportConstantRedefinition` diagnostics for `config/settings.py` predate this
   milestone.
-- The `IsOwner` permission is implemented and tested; upload models exist, but
-  no upload endpoints yet, and the owner-scoped querysets belong to the upload
-  milestone.
-- Market-data models exist with MySQL-enforced constraints, but upload
-  endpoints, Celery tasks, and Pandas processing are not implemented yet, so
-  job lifecycle/counter rules are only enforced at the model level
-  (`clean()` / DB checks), not by service code.
+- The Celery task body `apps.marketdata.tasks.process_ingestion_job` is not
+  implemented until milestone 05. The upload API queues the job ID, but a
+  worker cannot process it yet.
+- When broker dispatch fails, the job row, `IngestionFile`, and stored object
+  are deleted and the request returns `503`. No failed job row is retained
+  because `queued -> failed` is not a legal transition in DATA_MODEL.md;
+  retry with a new idempotency key. Dispatch runs inside the request and uses
+  Celery's broker connection defaults, so a slow broker can delay the response.
+- Stored uploads are retained for the worker. Until milestone 05 implements
+  worker cleanup, there is no periodic orphan-file cleanup.
+- The storage abstraction uses Django's storage API and was verified only with
+  local `FileSystemStorage`. No S3 backend is installed or tested; an S3
+  backend may buffer writes differently.
+- Content checks inspect only the first 64 KiB (CSV header, JSON start, XLSX
+  ZIP signature). Full row, encoding, and value validation belongs to the
+  processing milestone.
+- `MAX_UPLOAD_SIZE_BYTES` is the practical upload ceiling (default 50 MiB).
+  `IngestionJob.file_size_bytes` and `IngestionFile.file_size_bytes` are 64-bit,
+  so raising the limit within storage and worker capacity needs no schema
+  change. Truly unlimited uploads are not supported: unbounded bodies can
+  exhaust temp disk, storage, and worker capacity.
+- No cancel or retry endpoint exists. Job counters and terminal-state rules are
+  enforced by the model and database only until processing code updates them.
 - `sample_data/` was generated as an example; the repository does not track it.
 - No Docker, deployment, or AWS configuration; `gunicorn` is listed for Linux
   container serving but was not run on Windows.
