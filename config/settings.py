@@ -194,6 +194,20 @@ MEDIA_ROOT = env_path("DJANGO_MEDIA_ROOT", BASE_DIR / "media")
 # completion when they exceed this limit.
 MAX_UPLOAD_SIZE_BYTES = env_int("MAX_UPLOAD_SIZE_BYTES", 50 * 1024 * 1024)
 
+# Ingestion processing bounds. CHUNK_SIZE caps the frame handed to pandas;
+# DB_BATCH_SIZE caps each bulk_create call. The final partial batch is written
+# by the same bulk_create call, so no flush setting is needed.
+INGESTION_CHUNK_SIZE = env_int("INGESTION_CHUNK_SIZE", 5_000)
+INGESTION_DB_BATCH_SIZE = env_int("INGESTION_DB_BATCH_SIZE", 1_000)
+# Used when a file has no `exchange` column. The exchange row is created on
+# first use; files that name other exchange codes require those rows to exist.
+INGESTION_DEFAULT_EXCHANGE = (
+    env("INGESTION_DEFAULT_EXCHANGE", "XNYS") or ""
+).strip().upper()
+INGESTION_DEFAULT_EXCHANGE_TIMEZONE = env(
+    "INGESTION_DEFAULT_EXCHANGE_TIMEZONE", "America/New_York"
+)
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 REST_FRAMEWORK = {

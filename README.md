@@ -4,9 +4,9 @@ Market-data backend: Django + Django REST Framework, MySQL, Celery/Redis, and
 Pandas for processing. Current state: custom email/username user model and JWT
 authentication, the market-data ORM schema (ingestion jobs, files,
 exchanges/instruments, daily price records, validation issues, audit events,
-metric snapshots), a synthetic-data generator, and the upload API with durable
-job records and owner-scoped status. Ingestion processing, metrics, and
-analytics are not implemented yet.
+metric snapshots), a synthetic-data generator, the upload API with durable
+job records and owner-scoped status, and bounded CSV/JSON/XLSX ingestion
+processing. Metric formulas and analytics are not implemented yet.
 
 ## Requirements
 
@@ -91,6 +91,10 @@ local fallback. Host-provided variables win over `.env`.
 | `DJANGO_MEDIA_ROOT` | `media` | Filesystem media storage |
 | `DJANGO_STATIC_ROOT` | `staticfiles` | `collectstatic` target |
 | `MAX_UPLOAD_SIZE_BYTES` | `52428800` (50 MiB) | Streamed upload limit; larger requests get `413`. Size columns are 64-bit, so raising it needs no migration |
+| `INGESTION_CHUNK_SIZE` | `5000` | Rows per pandas frame/worker chunk |
+| `INGESTION_DB_BATCH_SIZE` | `1000` | Rows per `bulk_create` call; the final partial batch is written by the same call |
+| `INGESTION_DEFAULT_EXCHANGE` | `XNYS` | Exchange for files without an `exchange` column; created on first use |
+| `INGESTION_DEFAULT_EXCHANGE_TIMEZONE` | `America/New_York` | Timezone for the auto-created default exchange |
 
 Invalid configuration raises `ImproperlyConfigured` at import. There is no
 silent fallback to SQLite, a default secret, or an empty allowed-host list.
@@ -211,7 +215,8 @@ a release step to keep application processes read-only against the schema.
 `POST /api/v1/uploads/` accepts one CSV, JSON, or XLSX file, records an
 `IngestionJob` plus `IngestionFile`, and queues the job after the transaction
 commits. `GET /api/v1/jobs/{uuid}/` returns status and row counts to the owning
-user only. Processing itself is milestone 05.
+user only. The worker processes queued jobs as described under
+"Ingestion processing (milestone 05)".
 
 | Method | Path | Access | Notes |
 | --- | --- | --- | --- |
@@ -284,17 +289,19 @@ path. `storage_key` is not exposed by the API or the admin change form.
 The default backend is Django's local media storage (`DJANGO_MEDIA_ROOT`). The
 same calls use Django's storage interface, so an S3 backend that implements
 that interface can replace it without changing views. The stored object is kept
-for the worker and is deleted by ingestion cleanup in milestone 05. Files are
-deleted immediately when validation, storage, database persistence, or enqueue
-fails, and uploaded file handles are closed at the end of the request.
+for the worker and is deleted by ingestion cleanup after processing succeeds or
+fails. Files are deleted immediately when validation, storage, database
+persistence, or enqueue fails, and uploaded file handles are closed at the end
+of the request.
 
 ### Dispatch and status
 
 The job is committed inside `transaction.atomic()`, and
 `transaction.on_commit` calls Celery for
-`apps.marketdata.tasks.process_ingestion_job` with only the job UUID. The task
-body belongs to milestone 05. If dispatch fails, the API returns `503`, deletes
-the job row and stored object, and does not return `202`.
+`apps.marketdata.tasks.process_ingestion_job` with only the job UUID. If dispatch
+fails, the API returns `503`, deletes the job row and stored object, and does not
+return `202`. The worker entrypoint and failure handling are described under
+"Ingestion processing (milestone 05)".
 
 Job statuses are `queued -> running -> completed|failed|cancelled`; `running`
 is the processing state in DATA_MODEL.md. Transitions are enforced by
@@ -314,6 +321,122 @@ $job = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/uploads/
 Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:8000/api/v1/jobs/$($job.id)/" `
   -Headers @{ Authorization = "Bearer $($login.access)" }
 ```
+
+## Ingestion processing (milestone 05)
+
+`apps.marketdata.tasks.process_ingestion_job` consumes only the job UUID that
+the upload API queued. The worker claims `queued -> running` atomically, opens
+the stored upload, processes it in bounded chunks, and records `completed` or
+`failed`. A terminal or already-running job is skipped, so a duplicate Celery
+delivery does not process the same job twice. On failure, the job's partial
+`PriceRecord` rows are deleted, `ValidationIssue` rows are kept for diagnosis,
+and the stored upload is removed. The stored upload is also removed after a
+successful run.
+
+### Formats and row numbers
+
+All formats require the columns `symbol`, `timestamp`, `open`, `high`, `low`,
+`close`, and `volume`. Header cells are stripped, lowercased, and may be
+reordered; extra columns are ignored. `exchange`, `name`, `asset_class`,
+`currency`, and `adjusted_close` are optional. Files must be UTF-8.
+
+| Format | Reader | `row_number` meaning |
+| --- | --- | --- |
+| CSV | stdlib `csv.reader`, frames built per chunk | Physical line where the record starts; header is line 1 |
+| JSON | Incremental array decoding with `json.JSONDecoder.raw_decode` | 1-based record index in the array |
+| XLSX | `openpyxl` read-only active worksheet | 1-based worksheet row; the header has its own row |
+
+CSV parsing deliberately uses the stdlib reader rather than
+`pandas.read_csv(chunksize=...)`: pandas either raises on the first malformed
+line or skips it without a reliable line number. The stdlib reader makes the
+source line number exact and lets every malformed record become a
+`malformed_row` issue. pandas still performs the vectorized validation and
+normalization for each chunk. A blank CSV/XLSX row is skipped, not counted.
+
+JSON arrays are streamed. A single JSON object carrying the canonical columns
+is treated as one record; that form is read fully because there is no array to
+stream. An XLSX workbook is opened read-only and only one chunk of rows is
+materialized at a time.
+
+### Validation and issues
+
+Every failed rule creates a `ValidationIssue` with the row number, a stable
+error code, a short message, and a bounded `raw_row` preview (at most 12 fields,
+64 characters each). A row can have multiple issues. Rows with any issue are
+not persisted.
+
+| Rule | Issue code |
+| --- | --- |
+| Symbol blank or longer than 32 characters | `missing_symbol`, `invalid_symbol` |
+| Timestamp unparseable or missing | `invalid_timestamp` |
+| Price missing, non-numeric, infinite, `<= 0`, or above `DecimalField(18, 6)` | `missing_price`, `non_numeric_price`, `non_finite_price`, `non_positive_price`, `price_out_of_range` |
+| `high < low`, or `open`/`close` outside `[low, high]` after rounding | `invalid_ohlc_range`, `price_out_of_bounds` |
+| Optional `adjusted_close` invalid | `invalid_adjusted_close` |
+| Volume missing, non-numeric, infinite, negative, fractional, or above `2^63-1` | `missing_volume`, `non_numeric_volume`, `non_finite_volume`, `negative_volume`, `invalid_volume`, `volume_out_of_range` |
+| Exchange not configured | `unknown_exchange` |
+| Canonical record already exists or repeats in the file | `duplicate_record` |
+| Wrong CSV field count, non-object JSON value, wrong XLSX column count | `malformed_row` |
+
+File-level failures fail the job instead of storing partial data: empty input
+(`empty_file`), missing required columns (`missing_columns`), a malformed header
+(`invalid_header`), non-UTF-8 CSV/JSON (`invalid_encoding`), and unreadable
+JSON/XLSX (`malformed_input`). A file whose rows are all invalid completes with
+`rows_accepted = 0` and the issues attached; the job is not marked failed
+because the file itself was processed.
+
+`rows_received` counts data records, including malformed records and duplicates.
+`rows_accepted` is the number of `PriceRecord` rows committed for the job.
+`rows_rejected = rows_received - rows_accepted`, so it counts rows, not issues;
+one rejected row can have several issues.
+
+### Normalization and resolution
+
+- Symbols are stripped and uppercased. Instruments are created on first use and
+  are unique per `(exchange, symbol)`; name, asset class, and currency come from
+  the first row that creates the instrument and are not updated by later rows.
+- A file without an `exchange` column uses `INGESTION_DEFAULT_EXCHANGE`. That
+  exchange is created on first use with
+  `INGESTION_DEFAULT_EXCHANGE_TIMEZONE`. Any other exchange code in a file must
+  already exist in the `Exchange` table, otherwise its rows are rejected with
+  `unknown_exchange`.
+- Timestamps: a date-only value is the trading date. A naive datetime is
+  interpreted in the exchange timezone. An offset-aware datetime is converted to
+  the exchange timezone before the date is taken.
+- Prices are parsed as decimals, rounded half-up to six places, then checked for
+  positivity and OHLC shape. Volume must be a whole number in
+  `[0, 2^63-1]`.
+
+### Duplicate policy
+
+Duplicates are rejected, never overwritten, matching `DATA_MODEL.md`. The first
+valid row for an `(instrument, trading_date)` in a file wins; later copies in the
+same chunk, in a later chunk, or in an earlier job become `duplicate_record`
+issues. Cross-chunk and cross-job state comes from the database existence check,
+so deduplication does not grow an in-memory set per file. `bulk_create(...,
+ignore_conflicts=True)` protects the unique constraint against a concurrent
+writer; a row lost only to that race is counted as rejected without its own
+issue.
+
+### Bounded processing
+
+- `INGESTION_CHUNK_SIZE` (default 5000) bounds the frame handed to pandas.
+- `INGESTION_DB_BATCH_SIZE` (default 1000) bounds each `bulk_create`.
+- Each chunk is validated and persisted before the next is read, so failed
+  rows, model instances, and file contents are not accumulated for the whole
+  file. The final partial batch is written by the same `bulk_create` call.
+- The instrument resolver caches instruments for the job; its size follows the
+  number of distinct instruments, not rows. Duplicate detection is a per-chunk
+  database query keyed by the chunk's instruments and date span.
+- The processing package imports no Django request objects or views. Parsing and
+  normalization (`apps/marketdata/ingestion/`) are ORM-free; persistence and job
+  orchestration live under `apps/marketdata/jobs/ingestion/`.
+- Metric formulas are not implemented. `apps/marketdata/ingestion/metrics.py`
+  defines the `MetricCalculator` hook called once after a job's rows are
+  committed.
+
+Worker logs include the job ID, source type, chunk and batch sizes, received/
+accepted/rejected counts, issue count, duration, and a failure category. Raw
+records, row contents, and file contents are not logged.
 
 ## Data models (milestone 03)
 
@@ -394,10 +517,11 @@ job, so existence is not disclosed. The cross-user cases are covered by
   serializers, JWT views, throttling scopes, owner permission, tests
 - `apps/accounts/tests/integration/` - auth flow, migration, and startup probes
 - `apps/marketdata/` - schema (models, migration, admin), upload validation,
-  storage adapter, views, serializers, URLs, tests; ingestion processing and
-  analytics come later
-- `apps/marketdata/jobs/ingestion/` - queue dispatch after commit and cleanup
-  for unaccepted uploads
+  storage adapter, views, serializers, URLs, processing task, tests
+- `apps/marketdata/ingestion/` - ORM-free CSV/JSON/XLSX readers, header and
+  value validation, canonical normalization, metric hook
+- `apps/marketdata/jobs/ingestion/` - queue dispatch, persistence, bounded
+  dataset pipeline, worker claim/completion/cleanup
 - `apps/marketdata/tests/integration/` - real Celery broker connectivity probe
 - `scripts/generate_market_data.py` - deterministic synthetic OHLCV fixtures
 - `sample_data/` - optional local example output of the generator (not committed)
@@ -431,9 +555,12 @@ username and email at the serializer and database layers, password validators,
 login with username and with email, JWT refresh and blacklist logout, the
 unauthenticated boundary, CSRF-free API POSTs, cross-user ownership denial,
 superuser/admin creation, throttling for the credential endpoints, market-data
-constraints, and upload behavior (multipart/raw formats, size and content
-probes, idempotent replay, owner scoping, post-commit dispatch, and failure
-cleanup).
+constraints, upload behavior (multipart/raw formats, size and content probes,
+idempotent replay, owner scoping, post-commit dispatch, and failure cleanup),
+and ingestion processing (chunking, malformed rows, header validation, numeric
+and OHLC rules, timezone normalization, cross-chunk and cross-job duplicates,
+all-invalid inputs, failed-job rollback, file cleanup, and generated CSV/JSON/
+XLSX fixtures).
 
 Run database-backed suites sequentially. Two pytest processes share the
 configured MySQL test database; starting them in parallel fails with an existing
@@ -506,6 +633,28 @@ access, cross-user job access, post-commit dispatch, storage and enqueue
 failures, duplicate idempotency keys, owner-scoped keys, and path-traversal
 filenames. No live market API is used.
 
+## Verification (milestone 05, run 2026-10-20, Python 3.12.0, Django 5.2.18)
+
+| Command | Result |
+| --- | --- |
+| `python manage.py check` | `System check identified no issues (0 silenced)` |
+| `python manage.py makemigrations --check --dry-run` | `No changes detected` |
+| `pytest -q` with the MySQL test database | `126 passed` (25 new ingestion tests) |
+| `pytest -q -m "not integration"` | `122 passed, 4 deselected` |
+| `pytest -q -m integration` | `4 passed, 122 deselected` |
+| `ruff check apps config scripts manage.py` | `All checks passed!` |
+| `python manage.py spectacular --file <temp>` | exit 0, 9,116-byte schema |
+
+The new tests use fixed inline CSV/JSON/XLSX fixtures plus files generated by
+`scripts/generate_market_data.py`; no live market API is used. They cover empty
+inputs, missing/reordered headers, malformed CSV rows and JSON, non-UTF-8
+bytes, blank symbols, unknown exchanges, timezone-aware and naive timestamps,
+NaN/infinities/string numerics, OHLC bounds, negative/fractional volume,
+in-chunk and cross-chunk duplicates, conflicts with earlier jobs, all-invalid
+files, the final partial batch, metric-hook fan-out, failed-job rollback,
+stored-file cleanup, duplicate task delivery, and log fields. Ingestion ran
+against MySQL 8; no SQLite ingestion run was made.
+
 ## Known limitations
 
 - No password-reset endpoint (no email transport configured).
@@ -520,33 +669,49 @@ filenames. No live market API is used.
 - Throttle limits use LocMemCache when `REDIS_CACHE_URL` is unset, so they are
   per process. Redis cache connectivity was verified, but cross-process throttle
   limits were not load-tested.
-- basedpyright and pyrefly report 0 errors in `apps/`; basedpyright still emits
-  annotation warnings for untyped DRF and Django class attributes. Its
-  `reportConstantRedefinition` diagnostics for `config/settings.py` predate this
-  milestone.
-- The Celery task body `apps.marketdata.tasks.process_ingestion_job` is not
-  implemented until milestone 05. The upload API queues the job ID, but a
-  worker cannot process it yet.
+- Type checkers are not clean on the current tree: `basedpyright apps` reports 73
+  errors and 2,101 warnings, and `pyrefly check apps` reports 22 errors. Most are
+  pre-existing Django/DRF typing issues; the new ingestion code adds pandas
+  typing complaints. No type-check gate is enforced.
 - When broker dispatch fails, the job row, `IngestionFile`, and stored object
   are deleted and the request returns `503`. No failed job row is retained
   because `queued -> failed` is not a legal transition in DATA_MODEL.md;
   retry with a new idempotency key. Dispatch runs inside the request and uses
   Celery's broker connection defaults, so a slow broker can delay the response.
-- Stored uploads are retained for the worker. Until milestone 05 implements
-  worker cleanup, there is no periodic orphan-file cleanup.
 - The storage abstraction uses Django's storage API and was verified only with
   local `FileSystemStorage`. No S3 backend is installed or tested; an S3
   backend may buffer writes differently.
-- Content checks inspect only the first 64 KiB (CSV header, JSON start, XLSX
-  ZIP signature). Full row, encoding, and value validation belongs to the
-  processing milestone.
+- Upload content checks inspect only the first 64 KiB (CSV header, JSON start,
+  XLSX ZIP signature). Full row, encoding, and value validation happens in the
+  worker after `202`; errors there mark the job failed.
 - `MAX_UPLOAD_SIZE_BYTES` is the practical upload ceiling (default 50 MiB).
   `IngestionJob.file_size_bytes` and `IngestionFile.file_size_bytes` are 64-bit,
   so raising the limit within storage and worker capacity needs no schema
   change. Truly unlimited uploads are not supported: unbounded bodies can
   exhaust temp disk, storage, and worker capacity.
-- No cancel or retry endpoint exists. Job counters and terminal-state rules are
-  enforced by the model and database only until processing code updates them.
+- No cancel or retry endpoint exists. A failed job is terminal; upload the file
+  again with a new idempotency key.
+- Ingestion is not one long transaction. Each chunk is committed as it is
+  processed; on failure the job's `PriceRecord` rows are deleted and the job is
+  marked failed. If the worker process dies mid-run, the job can remain
+  `running` with partial rows and there is no lease or reaper yet.
+- A job with multiple `IngestionFile` rows processes only the first. The upload
+  API creates exactly one; the worker does not merge multiple files.
+- The instrument cache grows with distinct instruments in a job, not rows. A
+  pathological file with millions of distinct symbols would grow that cache.
+  Duplicate detection is a database query per chunk over the chunk's instrument
+  set and min/max date span.
+- CSV parsing uses the stdlib reader for accurate malformed-row line numbers
+  instead of `pandas.read_csv(chunksize=...)`. pandas is still used per chunk for
+  validation and normalization. A JSON root object is read fully; only JSON
+  arrays are streamed. XLSX parsing depends on `openpyxl` read-only mode.
+- `rows_rejected` counts rows, not issues; a single row can create several
+  `ValidationIssue` rows. `raw_row` previews are capped at 12 fields and 64
+  characters per value.
+- Cross-job write races are handled by the unique constraint plus
+  `INSERT IGNORE`; a row lost only to that race is counted rejected without an
+  individual issue. Metrics are not calculated or persisted yet; only the
+  `MetricCalculator` hook exists.
 - `sample_data/` was generated as an example; the repository does not track it.
 - No Docker, deployment, or AWS configuration; `gunicorn` is listed for Linux
   container serving but was not run on Windows.
