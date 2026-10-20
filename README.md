@@ -1,18 +1,19 @@
 AI Powered Backend Application
 
 Market-data backend: Django + Django REST Framework, MySQL, Celery/Redis, and
-Pandas for processing. Current state: bootstrap plus custom email-based user
-authentication (JWT with rotation/revocation and endpoint throttling). Business
-models and ingestion arrive in later milestones.
+Pandas for processing. Current state: custom email/username user model and JWT
+authentication. Market-data models, upload jobs, ingestion, and analytics are
+not implemented yet.
 
 ## Requirements
 
 - Python 3.12
-- MySQL 8.0 (runtime database)
-- Redis 7 (Celery broker and cache)
-- Windows, macOS, or Linux for local development; the container image targets Linux
+- MySQL 8.0 for the default database
+- Redis 7 for the Celery broker and shared cache (optional locally)
+- Windows, macOS, or Linux for local development
 
-Pinned ranges live in `requirements.txt` and `requirements-dev.txt`.
+Pinned ranges live in `requirements.txt` (runtime) and `requirements-dev.txt`
+(tests and tooling).
 
 ## Local setup
 
@@ -20,7 +21,7 @@ Pinned ranges live in `requirements.txt` and `requirements-dev.txt`.
 python -m venv venv
 .\venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 Copy-Item .env.example .env
-# edit .env: DJANGO_SECRET_KEY, DB_* (and MYSQL_APP_* only for Compose)
+# edit .env: set DJANGO_SECRET_KEY and the DB_* values
 ```
 
 Create the MySQL database named by `DB_NAME` and a user matching `DB_USER` /
@@ -28,14 +29,39 @@ Create the MySQL database named by `DB_NAME` and a user matching `DB_USER` /
 
 ```powershell
 .\venv\Scripts\python.exe manage.py migrate
+.\venv\Scripts\python.exe manage.py createsuperuser
 .\venv\Scripts\python.exe manage.py runserver
 ```
 
-`manage.py check` needs no database connection; `migrate` and `readyz` do.
+`createsuperuser` prompts for username, email, last name, and password. The
+custom user model must exist before the first migration of a database. A
+database migrated by milestone 01 with Django's built-in user has to be
+recreated (or migrated manually) before applying `accounts.0001_initial`.
+
+`manage.py check` needs no database connection. `migrate` and the startup
+migration hook do.
+
+### Redis in Docker
+
+When Django runs on the host and Redis runs in Docker, publish the Redis port
+and use `127.0.0.1` in `.env`:
+
+```powershell
+docker run -d --name marketdata-redis -p 6379:6379 redis:latest
+```
+
+```dotenv
+CELERY_BROKER_URL=redis://127.0.0.1:6379/0
+REDIS_CACHE_URL=redis://127.0.0.1:6379/1
+```
+
+Use a Compose service name such as `redis` only when Django itself runs inside
+the same Docker network. `redis://redis:6379` does not resolve from the Windows
+host and fails with `getaddrinfo failed`.
 
 ## Configuration
 
-Settings are read from the environment, with `.env` (git-ignored) loaded as a
+Settings are read from the process environment, with `.env` (git-ignored) as a
 local fallback. Host-provided variables win over `.env`.
 
 | Variable | Default | Notes |
@@ -44,200 +70,232 @@ local fallback. Host-provided variables win over `.env`.
 | `DJANGO_DEBUG` | `False` | Enables DEBUG and defaults docs on |
 | `DJANGO_ALLOWED_HOSTS` | empty | Comma-separated; required when DEBUG is off |
 | `DJANGO_TIME_ZONE` | `UTC` | `USE_TZ` is always on |
-| `DJANGO_LOG_LEVEL` | `INFO` | Root and `django` loggers |
-| `DB_ENGINE` | `mysql` | `sqlite` is an explicit local/test override |
+| `DJANGO_LOG_LEVEL` | `INFO` | Console logging level |
+| `DB_ENGINE` | `mysql` | Parsed but currently ignored; MySQL is the wired backend |
 | `DB_NAME`, `DB_USER`, `DB_PASSWORD` | none | Required for MySQL |
-| `DB_HOST`, `DB_PORT` | `127.0.0.1`, `3306` | `mysql` inside Compose |
+| `DB_HOST`, `DB_PORT` | `127.0.0.1`, `3306` | MySQL address |
 | `DB_TEST_NAME` | none | Test database name |
-| `CELERY_BROKER_URL` | `memory://` in DEBUG | Required when DEBUG is off |
-| `REDIS_CACHE_URL` | none | Unset means LocMemCache |
+| `CELERY_BROKER_URL` | `memory://` in DEBUG | `REDIS_URL` is accepted as a fallback; required when DEBUG is off |
+| `REDIS_CACHE_URL` | none | Unset means per-process LocMemCache |
+| `JWT_ACCESS_MINUTES` | `15` | Access-token lifetime in minutes |
+| `JWT_REFRESH_DAYS` | `7` | Refresh-token lifetime in days |
+| `AUTH_THROTTLE_REGISTER` | `5/min` | DRF rate for the `register` scope |
+| `AUTH_THROTTLE_LOGIN` | `10/min` | DRF rate for the `login` scope |
+| `AUTH_THROTTLE_REFRESH` | `20/min` | DRF rate for the `refresh` scope |
+| `AUTH_THROTTLE_LOGOUT` | `20/min` | DRF rate for the `logout` scope |
+| `AUTO_MIGRATE` | `True` | Apply pending migrations when WSGI/ASGI starts |
 | `SERVE_API_DOCS` | DEBUG | Serves `/api/schema/` and `/api/docs/` |
-| `JWT_ACCESS_MINUTES` | `30` | Access-token lifetime |
-| `JWT_REFRESH_DAYS` | `7` | Refresh-token lifetime; refresh tokens rotate |
-| `AUTH_THROTTLE_REGISTER` | `5/hour` | DRF rate for `POST /api/v1/auth/register/` |
-| `AUTH_THROTTLE_LOGIN` | `10/min` | DRF rate for `POST /api/v1/auth/token/` |
-| `AUTH_THROTTLE_REFRESH` | `30/min` | DRF rate for `POST /api/v1/auth/token/refresh/` |
 | `DJANGO_MEDIA_ROOT` | `media` | Filesystem media storage |
 | `DJANGO_STATIC_ROOT` | `staticfiles` | `collectstatic` target |
 
-Invalid configuration fails at import with `ImproperlyConfigured`; it never
-falls back to SQLite, a default secret, or an empty allowed-host list.
-
-## URLs
-
-- `/healthz` - process liveness, no dependency contacted
-- `/readyz` - readiness, returns 503 when MySQL is unreachable
-- `/api/schema/`, `/api/docs/` - OpenAPI schema and Swagger UI (when enabled)
-- `/admin/` - Django admin
+Invalid configuration raises `ImproperlyConfigured` at import. There is no
+silent fallback to SQLite, a default secret, or an empty allowed-host list.
+Integration probes override `DATABASES` with SQLite explicitly.
 
 ## Authentication
 
-`AUTH_USER_MODEL = "accounts.User"`. Login identity is the email address:
-stored lowercase, unique at the database layer, and there is no username column.
-`/admin/` creates users by email.
+- `apps.accounts.User` extends `AbstractUser`. The `accounts_user` columns are
+  `username` (unique, not null), `email` (unique, not null), `lastname` (not
+  null, Python field `last_name`), and `password` (Django hash).
+- Login accepts either the username or the email in the `username` field.
+  Matching is case-insensitive for both, with username taking precedence.
+- Email is normalized to lowercase, including the local part, on save and on
+  register/login. Duplicate emails and duplicate usernames with different casing
+  are rejected by the serializer.
+- Passwords use Django hashing and `AUTH_PASSWORD_VALIDATORS`, including the
+  similarity check against the username and email. Hashes are never returned.
+- API authentication is JWT via `djangorestframework-simplejwt`. Send
+  `Authorization: Bearer <access>`. Access tokens last `JWT_ACCESS_MINUTES`;
+  refresh tokens last `JWT_REFRESH_DAYS` and rotate on use.
+- The API does not use CSRF or session cookies. Django's CSRF middleware stays
+  enabled for `/admin/`, which is session-based.
+- Unknown usernames/emails, wrong passwords, and inactive accounts return the
+  same `401 {"detail": "No active account found with the given credentials"}`
+  response.
 
-| Method and path | Auth | Purpose |
-| --- | --- | --- |
-| `POST /api/v1/auth/register/` | public | Create a user; 201 returns the normalized `email` |
-| `POST /api/v1/auth/token/` | public | Email + password -> access and refresh JWTs |
-| `POST /api/v1/auth/token/refresh/` | public | Rotate a refresh token (the old one is blacklisted) |
-| `GET /api/v1/auth/me/` | JWT | Current user (id, email, names, date joined) |
-| `POST /api/v1/auth/logout/` | JWT | Blacklist the supplied refresh token |
+| Method | Path | Access | Notes |
+| --- | --- | --- | --- |
+| `POST` | `/api/v1/auth/register/` | public, throttled | Creates a user; `201` |
+| `POST` | `/api/v1/auth/login/` | public, throttled | Returns `access`, `refresh`, `user`; `200` |
+| `POST` | `/api/v1/auth/token/refresh/` | public, throttled | Rotates the refresh token; `200` |
+| `POST` | `/api/v1/auth/logout/` | public, throttled | Blacklists `refresh`; `200` |
+| `GET` | `/api/v1/auth/me/` | Bearer access token | Current user |
+| `GET` | `/api/schema/`, `/api/docs/` | public when enabled | OpenAPI schema and Swagger UI |
+| - | `/admin/` | staff session | Django admin |
 
-JWT handling uses `djangorestframework-simplejwt`. Access tokens are short-lived
-(`JWT_ACCESS_MINUTES`), refresh tokens rotate (`ROTATE_REFRESH_TOKENS`) and are
-revoked after rotation (`BLACKLIST_AFTER_ROTATION`) through the
-`token_blacklist` app, so replaying a rotated or logged-out refresh token returns
-401. DRF's default permission is `IsAuthenticated`, so new endpoints are private
-unless they opt out. Response bodies never contain password hashes or internals.
+All other DRF views default to `IsAuthenticated`.
 
-Credential endpoints use DRF `ScopedRateThrottle` with the scopes above;
-anonymous callers are keyed by client IP and authenticated callers by user id.
-Throttled calls return 429 with a generic `detail` and no account information.
-Rates come from the environment and are read by `ScopedRateThrottle` at import,
-so changing them requires a process restart.
+### Request examples
 
-`apps/accounts/tests/` forces `LocMemCache` for throttle counters, so the suite
-runs without Redis.
+Registration:
 
-### Which database am I hitting?
+```http
+POST /api/v1/auth/register/
+Content-Type: application/json
 
-There are two separate MySQL instances, each with its own schema and data:
-
-| Caller | Host and port | Database / user |
-| --- | --- | --- |
-| Host `manage.py` and `runserver` (`.env`) | `127.0.0.1:3306` | native MySQL, `ai_market_data` |
-| Compose `web`, `worker`, `migrate` | `mysql:3306` inside the network | `ai_market_data`, `market_data` |
-| Host client against Compose MySQL | `127.0.0.1:3407` | `ai_market_data`, `market_data` |
-
-Migrations run independently for each. A user registered through
-`localhost:8100` lives in the Compose database; `manage.py shell` on the host
-sees only the native database. To point host tooling at the Compose database,
-set `DB_HOST=127.0.0.1`, `DB_PORT=3407`, `DB_USER=market_data`,
-`DB_PASSWORD=market_data_local_pw` in `.env`.
-
-If registration returns 429, the register throttle (`5/hour` per IP) is active.
-For development either raise `AUTH_THROTTLE_REGISTER` in `.env` and recreate the
-web container, or clear the counters in the cache:
-
-```powershell
-docker compose exec redis redis-cli -n 1 DEL ":1:throttle_auth_register_172.18.0.1"
+{"username": "owner", "email": "owner@example.com", "last_name": "Owner", "password": "CorrectHorseBatteryStaple9"}
 ```
 
-A 400 with `A user with this email already exists.` is the duplicate-email
-check, not a missing schema. Both databases already contain `accounts_user`,
-`token_blacklist_*`, and the Django tables; inspect with
-`docker compose exec mysql mysql -umarket_data -pmarket_data_local_pw ai_market_data -e "SHOW TABLES;"`.
+Login. The `username` field takes either the username or the email:
+
+```http
+POST /api/v1/auth/login/
+Content-Type: application/json
+
+{"username": "owner", "password": "CorrectHorseBatteryStaple9"}
+```
+
+```http
+POST /api/v1/auth/login/
+Content-Type: application/json
+
+{"username": "owner@example.com", "password": "CorrectHorseBatteryStaple9"}
+```
+
+Refresh, logout, and current user:
+
+```http
+POST /api/v1/auth/token/refresh/
+Content-Type: application/json
+
+{"refresh": "<refresh token>"}
+```
+
+```http
+POST /api/v1/auth/logout/
+Content-Type: application/json
+
+{"refresh": "<refresh token>"}
+```
+
+```http
+GET /api/v1/auth/me/
+Authorization: Bearer <access token>
+```
+
+PowerShell smoke test:
+
+```powershell
+$login = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/auth/login/ `
+  -ContentType application/json `
+  -Body '{"username":"owner","password":"CorrectHorseBatteryStaple9"}'
+Invoke-RestMethod -Method Get -Uri http://127.0.0.1:8000/api/v1/auth/me/ `
+  -Headers @{ Authorization = "Bearer $($login.access)" }
+```
+
+### Throttling
+
+DRF `ScopedRateThrottle` is the default throttle class, and the register, login,
+refresh, and logout views also set it explicitly with
+`throttle_classes = [ScopedRateThrottle]` and a `throttle_scope`. Rates come from
+`AUTH_THROTTLE_REGISTER`, `AUTH_THROTTLE_LOGIN`, `AUTH_THROTTLE_REFRESH`, and
+`AUTH_THROTTLE_LOGOUT`. Throttle state lives in the configured cache: use
+`REDIS_CACHE_URL` in multi-process deployments, otherwise limits are per
+process. Throttled requests return `429` with DRF's generic message and do not
+include the submitted username, email, or password.
+
+### Migrations on startup
+
+`config/wsgi.py` and `config/asgi.py` call `config.startup.apply_migrations()`,
+which runs `migrate --noinput` when `AUTO_MIGRATE` is true. `manage.py runserver`
+loads the WSGI application, so the tables are created or updated before the
+server starts listening. Set `AUTO_MIGRATE=False` and run `manage.py migrate` as
+a release step to keep application processes read-only against the schema.
+
+### Ownership
+
+`apps/accounts/permissions.py:IsOwner` allows an object only when
+`obj.owner_id == request.user.pk`. Upload-job endpoints, when added, must filter
+querysets by the requesting user and combine that with this permission. The
+cross-user denial case is covered by `apps/accounts/tests/test_permissions.py`.
+
+## Layout
+
+- `config/` - settings, URLs, WSGI/ASGI, startup migration hook, Celery bootstrap
+- `config/settings_test.py` - test settings; keeps the configured database and
+  forces LocMemCache so tests need no Redis
+- `apps/accounts/` - custom user, manager, email-or-username backend, admin,
+  serializers, JWT views, throttling scopes, owner permission, tests
+- `apps/accounts/tests/integration/` - auth flow, migration, and startup probes
+- `apps/marketdata/` - ingestion app placeholder; models and processing come later
+- `manage.py` - command entrypoint
+- `pytest.ini` - `DJANGO_SETTINGS_MODULE=config.settings_test`, tests under `apps/`
 
 ## Tests
 
 ```powershell
-$env:REDIS_CACHE_URL=""   # keep throttle counters local
-.\venv\Scripts\python.exe -m pytest apps/accounts -q
+# Full suite, using the database configured by .env (MySQL by default)
+.\venv\Scripts\python.exe -m pytest -q
+
+# Integration marker only
+.\venv\Scripts\python.exe -m pytest -q -m integration
 ```
 
-Covered: email normalization, duplicate email across case, password validation,
-missing/invalid credentials, inactive accounts, unauthenticated access, token
-rotation and blacklist, logout, and throttling of register/login/refresh.
+Integration tests live in `apps/accounts/tests/integration/`:
 
-## Docker artifacts
+- `test_auth_flow.py` drives register, login by username and email, `/me/`,
+  refresh rotation, logout blacklisting, and CSRF-free API requests.
+- `test_schema.py` starts fresh Django processes for two probes: migration
+  `0002` against legacy `0001` rows and WSGI startup table creation. The probes
+  use `probe_settings.py` and isolated SQLite files, so they do not touch the
+  configured MySQL database.
 
-`Dockerfile`, `docker-compose.yml`, `docker-compose.override.yml`, `Makefile`,
-`scripts/dev.ps1`, and `docker/entrypoint.sh` were already present and consume
-this configuration (`config.wsgi:application`, `celery -A config`, `/readyz`,
-`.env`). The Docker orchestration itself is a separate milestone and the image
-has not been built here.
-
-## Layout
-
-- `config/` - settings, URLs, WSGI/ASGI, Celery bootstrap, health views
-- `apps/accounts/` - custom email user, admin, JWT register/login/logout views, tests
-- `apps/marketdata/` - ingestion app; processing, models, tasks in later milestones
-- `pytest.ini` - `DJANGO_SETTINGS_MODULE=config.settings`, tests under `apps/`
-
-## Running with Docker
-
-The Compose project is `ai-powered-market-data-analysis`, a name derived from this
-repository so it cannot collide with another local stack. `docker compose up`
-merges `docker-compose.override.yml` (bind-mounted source, DEBUG on, published
-ports):
-
-```powershell
-docker compose up -d --build
-docker compose ps
-docker compose logs -f web worker
-```
-
-| Host | Service |
-| --- | --- |
-| `http://localhost:8100/healthz` | liveness |
-| `http://localhost:8100/readyz` | readiness (MySQL) |
-| `http://localhost:8100/api/docs/` | Swagger UI |
-| `http://localhost:8100/admin/` | Django admin |
-| `localhost:3407` | MySQL (`ai_market_data`) |
-| `localhost:6480` | Redis |
-
-The one-shot `migrate` service runs before `web` and `worker`; both wait for it to
-exit 0. Use `docker compose down` to stop (volumes persist) and
-`docker compose down -v` to wipe the database.
+The rest of the suite covers registration and email normalization, duplicate
+username and email at the serializer and database layers, password validators,
+login with username and with email, JWT refresh and blacklist logout, the
+unauthenticated boundary, CSRF-free API POSTs, cross-user ownership denial,
+superuser/admin creation, and throttling for the credential endpoints.
 
 ## Verification (run 2026-10-20, Python 3.12.0)
 
-Installed with `pip install -r requirements.txt` and
-`pip install -r requirements-dev.txt`: Django 5.2.18, DRF 3.18.3,
-drf-spectacular 0.30.0, mysqlclient 2.3.0, celery 5.6.3, redis 6.4.0,
-pandas 3.0.6, numpy 2.5.4, whitenoise 6.12.0, pytest 9.1.1,
-pytest-django 4.14.0.
+Installed versions: Django 5.2.18, DRF 3.16.1, djangorestframework-simplejwt
+5.5.1, drf-spectacular 0.30.0, mysqlclient 2.3.0, pytest 8.4.2.
 
 | Command | Result |
 | --- | --- |
-| `python manage.py check` (with `.env`) | `System check identified no issues` |
-| `DB_ENGINE=sqlite python manage.py check --database default` | no issues |
-| `DB_ENGINE=sqlite DB_NAME=<temp> python manage.py migrate --noinput` | migrations applied |
-| Test client: `/healthz`, `/readyz`, `/api/docs/`, `/api/schema/` | 200, 200, 200, 200 |
-| `collectstatic` into temp `STATIC_ROOT` | 154 files; `/static/admin/css/base.css` 200 |
-| `bash -n docker/entrypoint.sh` | exit 0 |
-| Missing `DJANGO_SECRET_KEY` | `ImproperlyConfigured` |
-| `DB_ENGINE=postgres` | `ImproperlyConfigured: Unsupported DB_ENGINE` |
-| `DJANGO_DEBUG=False` without broker URL | `ImproperlyConfigured: CELERY_BROKER_URL` |
-| `git check-ignore -v .env` | matched `.gitignore:11` |
-| `docker compose up -d --build` | migrate exited 0; web, worker, mysql, redis healthy |
-| `GET localhost:8100/healthz`, `/readyz`, `/api/docs/`, `/api/schema/` | 200, 200, 200, 200 |
-| `GET localhost:8100/` | 404 (no root route yet) |
-| Host ports `3407`, `6480`, `8100` | reachable; `8000` released |
-| `ai_market_data.django_migrations` | 18 rows applied |
-| worker log | `Connected to redis://redis:6379/0`, `celery@... ready` |
-
-Milestone 02 (custom user, JWT auth, throttling), run on the native MySQL 8
-instance at `127.0.0.1:3306` (fresh database `ai_market_data`, empty before
-`migrate`):
-
-| Command | Result |
-| --- | --- |
-| `python manage.py makemigrations accounts` | created `apps/accounts/migrations/0001_initial.py` |
-| `python manage.py migrate --noinput` | all migrations applied, including `token_blacklist` |
-| `python manage.py makemigrations --check --dry-run` | `No changes detected` |
 | `python manage.py check` | `System check identified no issues` |
-| `python manage.py spectacular --file <temp>` | OpenAPI schema generated, exit 0 |
-| `$env:REDIS_CACHE_URL=""; python -m pytest apps/accounts -q` | `22 passed` |
-| Live `POST localhost:8100/api/v1/auth/register|token|refresh` (Docker MySQL) | 201, 200, 200; `me` 200; logout 204; replayed refresh 401 |
-| Duplicate email over the same endpoint | 400 `A user with this email already exists.` |
-| Compose `migrate` status (`showmigrations`) | `accounts.0001` and `token_blacklist.*` applied |
-| `SHOW TABLES` on Compose MySQL | `accounts_user`, `token_blacklist_*`, Django tables present |
+| `python manage.py makemigrations --check --dry-run` | `No changes detected` |
+| `pytest -q --create-db` with MySQL | 29 passed |
+| `pytest -q -m integration` | 3 passed |
+| Migration probe: `0001` with three users, then `0002` | usernames `alice`, `alice2`, `bob`; `lastname` column; unique username/email indexes; rows preserved |
+| Startup probe: import `config.wsgi` with `AUTO_MIGRATE=True` | `accounts_user` and `token_blacklist_outstandingtoken` created; `username` and `lastname` present |
+| `cache.set` / `cache.get` through `REDIS_CACHE_URL=redis://127.0.0.1:6379/1` | returned `ok` |
+| Celery `app.connection().ensure_connection()` | broker connection succeeded |
+| Six registration `POST`s at the default `5/min` | `201, 201, 201, 201, 201, 429` |
+| `python manage.py spectacular --file <temp>` | exit 0, no schema errors |
+| `ruff check apps config manage.py` | `All checks passed!` |
+| `basedpyright apps` | 0 errors |
+| `pyrefly check apps` | 0 errors |
 
-Host-level runs before milestone 02 used SQLite; the auth suite now runs against
-MySQL because it exercises the unique email constraint.
+The local MySQL server was available at `127.0.0.1:3306` and was used for the
+main suite. The integration probes use isolated SQLite files in subprocesses.
+Redis 7 was available through Docker; cache reads/writes and the Celery broker
+connection succeeded, but cross-process throttle load behavior was not tested.
+`basedpyright` 1.40.2 and `pyrefly` 1.4.0 are available in the local virtualenv
+but are not pinned in `requirements-dev.txt`.
 
 ## Known limitations
 
-- Upload-job ownership (user A cannot read user B's job) is not enforceable yet:
-  `apps/marketdata` has no job models. `IsAuthenticated` is the DRF default, and
-  job lookups must be scoped by owner when milestone 03/04 adds the models.
-- Password reset is not implemented, so its throttling scope does not exist and
-  no email delivery is configured.
-- Throttle counters use the configured cache. With the default `LocMemCache`
-  they are per process, so multiple workers multiply the effective rate; set
-  `REDIS_CACHE_URL` to share counters across workers.
-- `/` returns 404 (no root route), and the Docker stack was not rebuilt for this
-  milestone; its MySQL volume is separate from the host database used above.
-- The image was built and run locally, but no production deployment was exercised.
+- No password-reset endpoint (no email transport configured).
+- Access tokens are stateless and cannot be revoked before they expire. Logout
+  blacklists only the refresh token.
+- `AUTO_MIGRATE=True` runs `migrate` from the WSGI/ASGI import hook. Multiple
+  workers can start at the same time; use a release step with
+  `AUTO_MIGRATE=False` for larger deployments.
+- Django admin keeps session and CSRF protection; only the API is CSRF-free.
+- Username uniqueness is case-insensitive in the serializer, but the SQLite
+  unique index is case-sensitive. MySQL's default collation is case-insensitive.
+- Throttle limits use LocMemCache when `REDIS_CACHE_URL` is unset, so they are
+  per process. Redis cache connectivity was verified, but cross-process throttle
+  limits were not load-tested.
+- basedpyright and pyrefly report 0 errors in `apps/`; basedpyright still emits
+  annotation warnings for untyped DRF and Django class attributes. Its
+  `reportConstantRedefinition` diagnostics for `config/settings.py` predate this
+  milestone.
+- The `IsOwner` permission is implemented and tested, but no upload-job models or
+  endpoints exist yet; owner-scoped querysets belong to the upload milestone.
+- No market-data models, upload endpoints, Celery tasks, or Pandas processing.
+- No Docker, deployment, or AWS configuration; `gunicorn` is listed for Linux
+  container serving but was not run on Windows.
+- Changing `AUTH_USER_MODEL` after a database has production data requires a
+  migration plan; this milestone assumes no production data.
