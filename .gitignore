@@ -1,11 +1,11 @@
-.htaccess
-css.php
-rpc/
-sites/site*/admin/
-sites/site*/private/
-sites/site*/public/admin/
-sites/site*/public/setup/
-sites/site*/public/theme/
-textpattern/
-HISTORY.txt
-README.txt
+# Local editor settings
+.vscode/
+
+# Keep the user-facing README tracked; ignore other Markdown guidance/state files.
+*.md
+!README.md
+.opencode
+agent_prompts
+venv
+*.env
+*.gitignore
