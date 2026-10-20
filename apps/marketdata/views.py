@@ -1,4 +1,3 @@
-from rest_framework.permissions import IsAuthenticated
 import logging
 import time
 import uuid
@@ -14,6 +13,7 @@ from django.urls import reverse
 from drf_spectacular.utils import extend_schema
 from rest_framework import status as http_status
 from rest_framework.exceptions import ParseError, UnsupportedMediaType
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -59,7 +59,7 @@ class UploadInput:
 
 
 class UploadView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated]  # noqa: RUF012
     @extend_schema(
         request=UploadRequestSerializer,
         responses={202: UploadAcceptedSerializer},
@@ -180,7 +180,7 @@ class UploadView(APIView):
 
 
 class JobDetailView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated]  # noqa: RUF012
     @extend_schema(responses=IngestionJobSerializer)
     def get(self, request, job_id):
         job = get_object_or_404(
