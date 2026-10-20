@@ -190,6 +190,10 @@ STATIC_ROOT = env_path("DJANGO_STATIC_ROOT", BASE_DIR / "staticfiles")
 MEDIA_URL = "/media/"
 MEDIA_ROOT = env_path("DJANGO_MEDIA_ROOT", BASE_DIR / "media")
 
+# Upload transport bound. Files are streamed to storage and rejected before
+# completion when they exceed this limit.
+MAX_UPLOAD_SIZE_BYTES = env_int("MAX_UPLOAD_SIZE_BYTES", 50 * 1024 * 1024)
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 REST_FRAMEWORK = {

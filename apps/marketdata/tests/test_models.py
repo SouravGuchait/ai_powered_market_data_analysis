@@ -425,6 +425,21 @@ def test_job_delete_cascades_files_and_issues_but_not_prices(record, job):
     assert ValidationIssue.objects.filter(ingestion_job_id=job.id).count() == 0
 
 
+def test_ingestion_file_size_supports_above_32_bits(job):
+    file = IngestionFile.objects.create(
+        ingestion_job=job,
+        original_filename="large.csv",
+        storage_key="uploads/1/2/large.csv",
+        checksum="b" * 64,
+        content_type="text/csv",
+        file_size_bytes=5 * 1024**3,
+    )
+
+    file.refresh_from_db()
+
+    assert file.file_size_bytes == 5 * 1024**3
+
+
 def test_instrument_deletion_protected(record, instrument, exchange):
     with pytest.raises(ProtectedError) as excinfo:
         instrument.delete()

@@ -306,7 +306,7 @@ class IngestionFile(models.Model):
     # Lowercase SHA-256 hex digest of the stored file content.
     checksum = models.CharField(max_length=64)
     content_type = models.CharField(max_length=64, blank=True, default="")
-    file_size_bytes = models.PositiveIntegerField(null=True, blank=True)
+    file_size_bytes = models.PositiveBigIntegerField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
