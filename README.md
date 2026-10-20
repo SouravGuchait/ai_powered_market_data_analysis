@@ -2,8 +2,10 @@ AI Powered Backend Application
 
 Market-data backend: Django + Django REST Framework, MySQL, Celery/Redis, and
 Pandas for processing. Current state: custom email/username user model and JWT
-authentication. Market-data models, upload jobs, ingestion, and analytics are
-not implemented yet.
+authentication, plus the market-data ORM schema (ingestion jobs, files,
+exchanges/instruments, daily price records, validation issues, audit events,
+metric snapshots) with a synthetic-data generator. Upload endpoints,
+ingestion, processing, and analytics are not implemented yet.
 
 ## Requirements
 
@@ -202,6 +204,67 @@ loads the WSGI application, so the tables are created or updated before the
 server starts listening. Set `AUTO_MIGRATE=False` and run `manage.py migrate` as
 a release step to keep application processes read-only against the schema.
 
+## Data models (milestone 03)
+
+`apps/marketdata/models.py` implements the approved schema with database-level
+constraints; the full decision list (deletion policies, duplicate policy,
+precision, index justification) lives in `DATA_MODEL.md`.
+
+- `Exchange`, `Instrument`: `Instrument` is unique per `(exchange, symbol)`;
+  exchange codes, symbols, and currency codes are uppercased on save. Unknown
+  exchange timezones are rejected in `clean()`.
+- `PriceRecord`: one canonical row per `(instrument, trading_date)`; conflicting
+  imports must be rejected by the ingestion layer, never overwritten. Prices
+  are `DecimalField(18, 6)`; all prices must be positive and the OHLC shape
+  (`low <= open|close <= high`) is enforced by MySQL check constraints. Volume
+  is an unsigned big integer.
+- `IngestionJob`: UUID key, user-owned (`created_by`), lifecycle
+  `queued -> running -> completed|failed|cancelled` with no legal exit from a
+  terminal state (`clean()` + `assert_transition()`). Counters cannot be
+  negative or exceed `rows_received` (DB checks). `idempotency_key` is
+  optional but unique per owner. Job state lives in MySQL only.
+- `IngestionFile`: storage-relative `storage_key` (kept out of the admin and
+  the future API), lowercase SHA-256 `checksum`, size and content type. Files
+  live in configured storage, never in a database column.
+- `ValidationIssue`: multiple issues per row allowed; indexed by job+row and
+  job+error code. `raw_row` stays out of the admin change form.
+- `AuditEvent`: nullable user, stable action names, `GenericIPAddressField`,
+  bounded JSON metadata; indexed by `(user, created_at)` and
+  `(object_type, object_id)`.
+- `MetricSnapshot`: persisted analytics only; values are fractions with
+  `DecimalField(20, 8)`. `lookback_days = 0` marks non-windowed metrics so the
+  unique natural key
+  `(instrument, as_of_date, metric_type, lookback_days, calculation_version)`
+  never relies on NULL duplicates.
+
+All eight models are registered in `apps/marketdata/admin.py` with list
+displays, search/filter support, raw-id inputs for large foreign keys, and
+pagination; storage keys and raw row payloads are hidden there.
+
+### Synthetic data
+
+Deterministic offline generator for development and testing (no database,
+Django config, or market API):
+
+```powershell
+.\venv\Scripts\python.exe scripts\generate_market_data.py --symbols 5 --days 100 --seed 42 --output-dir sample_data
+```
+
+Options: `--symbols`, `--days`, `--seed`, `--output-dir`, `--start-date`;
+`--help` lists all. Same seed produces byte-identical CSV output. It writes:
+
+| File | Content |
+| --- | --- |
+| `synthetic_market_clean.csv/json/xlsx` | valid daily OHLCV rows, shared trading dates |
+| `synthetic_market_dirty.csv/json/xlsx` | same shape with missing fields, bad OHLC shape, negative volume/price, malformed.timestamp strings, bad types, null closes, empty strings, duplicate dates |
+| `synthetic_market_empty.csv/json/xlsx` | empty datasets (0-byte CSV/JSON, header-only XLSX) |
+| `synthetic_market_unexpected_columns.csv` | otherwise-valid rows plus an extra `unexpected_extra` column |
+
+Rows always contain the documented columns `exchange, symbol, name,
+asset_class, currency, timestamp, open, high, low, close, adjusted_close,
+volume`; `timestamp` is an ISO date string. Dirty files stay distinguishable
+by name, and the clean files are asserted corruption-free at generation time.
+
 ### Ownership
 
 `apps/accounts/permissions.py:IsOwner` allows an object only when
@@ -217,7 +280,10 @@ cross-user denial case is covered by `apps/accounts/tests/test_permissions.py`.
 - `apps/accounts/` - custom user, manager, email-or-username backend, admin,
   serializers, JWT views, throttling scopes, owner permission, tests
 - `apps/accounts/tests/integration/` - auth flow, migration, and startup probes
-- `apps/marketdata/` - ingestion app placeholder; models and processing come later
+- `apps/marketdata/` - schema (models, migration, admin), tests; ingestion
+  processing and analytics come later
+- `scripts/generate_market_data.py` - deterministic synthetic OHLCV fixtures
+- `sample_data/` - optional local example output of the generator (not committed)
 - `manage.py` - command entrypoint
 - `pytest.ini` - `DJANGO_SETTINGS_MODULE=config.settings_test`, tests under `apps/`
 
@@ -246,7 +312,7 @@ login with username and with email, JWT refresh and blacklist logout, the
 unauthenticated boundary, CSRF-free API POSTs, cross-user ownership denial,
 superuser/admin creation, and throttling for the credential endpoints.
 
-## Verification (run 2026-10-20, Python 3.12.0)
+## Verification (milestone 02, run 2026-10-20, Python 3.12.0)
 
 Installed versions: Django 5.2.18, DRF 3.16.1, djangorestframework-simplejwt
 5.5.1, drf-spectacular 0.30.0, mysqlclient 2.3.0, pytest 8.4.2.
@@ -274,6 +340,24 @@ connection succeeded, but cross-process throttle load behavior was not tested.
 `basedpyright` 1.40.2 and `pyrefly` 1.4.0 are available in the local virtualenv
 but are not pinned in `requirements-dev.txt`.
 
+## Verification (milestone 03, run 2026-10-20, Python 3.12.0, Django 5.2.18)
+
+| Command | Result |
+| --- | --- |
+| `python manage.py check` | `System check identified no issues (0 silenced)` |
+| `python manage.py makemigrations --check --dry-run` | `No changes detected` |
+| `python manage.py migrate` against the configured MySQL database | `Applying marketdata.0001_initial... OK` |
+| `python manage.py showmigrations marketdata` | `[X] 0001_initial` |
+| Generated migration review | Creation-only operations (create model/index/constraint), no `Delete`/`Alter` destructive ops |
+| `pytest -q` with the MySQL test database | `75 passed` (46 new marketdata tests + 29 previous accounts tests) |
+| `pytest -q -m integration` | `3 passed` |
+| `ruff check apps config scripts manage.py` | `All checks passed!` |
+| `python scripts/generate_market_data.py --symbols 5 --days 100 --seed 42 --output-dir sample_data` | 10 files, 3128 fixture rows; clean CSV: 500 rows, dirty CSV: 501 rows |
+| Schema probes on MySQL | duplicate `(instrument, trading_date)` -> IntegrityError; duplicate idempotency key per owner -> IntegrityError; check-constraint violations -> IntegrityError; negative counters/overflow -> DataError; all named indexes present via `connection.introspection.get_constraints` |
+
+Constraints verified only against MySQL 8 (`InnoDB`): unsigned counters and
+check constraints; other backends are not wired in this project.
+
 ## Known limitations
 
 - No password-reset endpoint (no email transport configured).
@@ -292,9 +376,14 @@ but are not pinned in `requirements-dev.txt`.
   annotation warnings for untyped DRF and Django class attributes. Its
   `reportConstantRedefinition` diagnostics for `config/settings.py` predate this
   milestone.
-- The `IsOwner` permission is implemented and tested, but no upload-job models or
-  endpoints exist yet; owner-scoped querysets belong to the upload milestone.
-- No market-data models, upload endpoints, Celery tasks, or Pandas processing.
+- The `IsOwner` permission is implemented and tested; upload models exist, but
+  no upload endpoints yet, and the owner-scoped querysets belong to the upload
+  milestone.
+- Market-data models exist with MySQL-enforced constraints, but upload
+  endpoints, Celery tasks, and Pandas processing are not implemented yet, so
+  job lifecycle/counter rules are only enforced at the model level
+  (`clean()` / DB checks), not by service code.
+- `sample_data/` was generated as an example; the repository does not track it.
 - No Docker, deployment, or AWS configuration; `gunicorn` is listed for Linux
   container serving but was not run on Windows.
 - Changing `AUTH_USER_MODEL` after a database has production data requires a
