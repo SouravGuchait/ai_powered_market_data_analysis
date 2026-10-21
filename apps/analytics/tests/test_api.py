@@ -2,6 +2,8 @@ from datetime import date, timedelta
 
 import pytest
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
+from rest_framework.response import Response
 from rest_framework.test import APIClient
 
 from apps.marketdata.models import (
@@ -11,6 +13,13 @@ from apps.marketdata.models import (
     PriceRecord,
     ValidationIssue,
 )
+
+
+@pytest.fixture(autouse=True)
+def clear_analytics_cache():
+    cache.clear()
+    yield
+    cache.clear()
 
 
 @pytest.fixture
@@ -183,3 +192,81 @@ def test_job_issues_are_owner_scoped_and_paginated(owner, market):
     )
     client.force_authenticate(stranger)
     assert client.get(f"/api/v1/jobs/{job.pk}/issues/").status_code == 404
+
+
+@pytest.mark.django_db
+def test_analytics_cache_hits_and_scopes_by_user_and_filters(owner, market, monkeypatch):
+    import apps.analytics.api as analytics_api
+
+    calls = 0
+    build = analytics_api._build_summary
+
+    def counted(*args):
+        nonlocal calls
+        calls += 1
+        return build(*args)
+
+    monkeypatch.setattr(analytics_api, "_build_summary", counted)
+    client = APIClient()
+    client.force_authenticate(owner)
+    params = {"symbol": " aaa ", "exchange": "xnys", "start_date": "2024-01-01", "end_date": "2024-01-25"}
+    assert client.get("/api/v1/analytics/summary/", params).status_code == 200
+    assert client.get("/api/v1/analytics/summary/", params).status_code == 200
+    assert calls == 1
+    changed = params | {"end_date": "2024-01-24"}
+    client.get("/api/v1/analytics/summary/", changed)
+    assert calls == 2
+    stranger = get_user_model().objects.create_user(
+        username="analytics-cache-stranger", email="cache-stranger@example.com", password="pass12345"
+    )
+    client.force_authenticate(stranger)
+    assert client.get("/api/v1/analytics/summary/", params).status_code == 400
+    assert calls == 3  # the stranger's permission failure is evaluated, never cached
+
+
+@pytest.mark.django_db
+def test_analytics_cache_invalidation_and_backend_failure_fallback(owner, market, monkeypatch):
+    import apps.analytics.api as analytics_api
+    import apps.analytics.cache as analytics_cache
+
+    client = APIClient()
+    client.force_authenticate(owner)
+    params = {"symbol": "AAA", "exchange": "XNYS", "start_date": "2024-01-01", "end_date": "2024-01-25"}
+    url = "/api/v1/analytics/summary/"
+    original = analytics_api._build_summary
+    calls = 0
+
+    def counted(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(analytics_api, "_build_summary", counted)
+    client.get(url, params)
+    analytics_cache.invalidate_owner_analytics(owner.pk)
+    client.get(url, params)
+    assert calls == 2
+
+    class UnavailableCache:
+        def get(self, *args, **kwargs):
+            raise OSError("cache unavailable")
+
+        def set(self, *args, **kwargs):
+            raise OSError("cache unavailable")
+
+    monkeypatch.setattr(analytics_cache, "cache", UnavailableCache())
+    response = client.get(url, params)
+    assert response.status_code == 200
+    assert response.data["price_aggregate"]["observation_count"] == 25
+
+
+def test_analytics_cache_is_separate_by_user_and_filters():
+    from apps.analytics.cache import analytics_response
+
+    first = analytics_response(101, "summary", {"symbol": "AAA"}, lambda: Response({"user": 101}))
+    same = analytics_response(101, "summary", {"symbol": "AAA"}, lambda: Response({"user": -1}))
+    other_user = analytics_response(102, "summary", {"symbol": "AAA"}, lambda: Response({"user": 102}))
+    other_filter = analytics_response(101, "summary", {"symbol": "BBB"}, lambda: Response({"user": 101}))
+    assert first.data == same.data == {"user": 101}
+    assert other_user.data == {"user": 102}
+    assert other_filter.data == {"user": 101}

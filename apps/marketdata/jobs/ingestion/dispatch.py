@@ -3,7 +3,9 @@
 import logging
 import uuid
 
+from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
 
 from apps.marketdata.models import IngestionFile, IngestionJob
 from apps.marketdata.storage import delete_stored_upload
@@ -23,6 +25,53 @@ def dispatch_ingestion_job(job_id: str) -> str | None:
 
     result = app.send_task(INGESTION_TASK_NAME, args=[job_id])
     return result.id
+
+
+def dispatch_pending_ingestion_jobs(batch_size: int | None = None) -> dict[str, int]:
+    """Dispatch queued jobs without a recorded task ID in a locked bounded batch."""
+    limit = batch_size or settings.INGESTION_DISPATCH_BATCH_SIZE
+    eligible = IngestionJob.objects.filter(
+        status=IngestionJob.Status.QUEUED, task_id__isnull=True
+    )
+    eligible_count = eligible.count()
+    dispatched = 0
+    failures = 0
+
+    with transaction.atomic():
+        jobs = list(
+            eligible.order_by("requested_at", "pk")
+            .select_for_update(skip_locked=True)[:limit]
+        )
+        for job in jobs:
+            try:
+                task_id = dispatch_ingestion_job(str(job.pk))
+            except Exception as exc:  # noqa: BLE001 - broker errors leave jobs eligible
+                failures += 1
+                logger.warning(
+                    "ingestion.scheduled_dispatch.failed job_id=%s error_type=%s",
+                    job.pk,
+                    type(exc).__name__,
+                )
+                continue
+
+            job.task_id = task_id or str(uuid.uuid4())
+            job.save(update_fields=["task_id", "updated_at"])
+            dispatched += 1
+            logger.info(
+                "ingestion.scheduled_dispatch.succeeded job_id=%s task_id=%s",
+                job.pk,
+                job.task_id,
+            )
+
+    logger.info(
+        "ingestion.scheduled_dispatch.finished eligible=%d dispatched=%d failures=%d batch_size=%d timestamp=%s",
+        eligible_count,
+        dispatched,
+        failures,
+        limit,
+        timezone.now().isoformat(),
+    )
+    return {"eligible": eligible_count, "dispatched": dispatched, "failures": failures}
 
 
 def enqueue_after_commit(job_id: uuid.UUID) -> None:

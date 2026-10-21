@@ -8,3 +8,6 @@ CACHES = {
         "LOCATION": "marketdata-tests",
     }
 }
+
+INGESTION_DISPATCH_INTERVAL_SECONDS = 0
+CELERY_BEAT_SCHEDULE.pop("marketdata-pending-ingestion-dispatch", None)
