@@ -10,6 +10,7 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.serializers import CharField, DateField, IntegerField, Serializer
 
+from apps.analytics.cache import analytics_response
 from apps.marketdata.ingestion.metrics import (
     calculate_daily_returns,
     calculate_drawdowns,
@@ -96,6 +97,15 @@ def _owned_records(user, data, *, context_days=0):
 def _series(request, metric):
     started = time.monotonic()
     data = _request_data(request, window=metric in {"moving_average", "rolling_volatility"})
+    return analytics_response(
+        request.user.pk,
+        metric,
+        data,
+        lambda: _build_series(request, metric, data, started),
+    )
+
+
+def _build_series(request, metric, data, started):
     paginator = AnalyticsPagination()
     window = data.get("window", 5 if metric == "moving_average" else 20)
     context = window if metric == "moving_average" else window + 1 if metric == "rolling_volatility" else 1 if metric == "daily_return" else 0
@@ -141,6 +151,16 @@ def _series(request, metric):
 
 def summary(request):
     data = _request_data(request)
+    return analytics_response(
+        request.user.pk,
+        "summary",
+        data,
+        lambda: _build_summary(request, data),
+        as_response=False,
+    )
+
+
+def _build_summary(request, data):
     records, instrument = _owned_records(request.user, data)
     stats = records.aggregate(count=Count("pk"), minimum=Min("close"), maximum=Max("close"), average=Avg("close"))
     return {"symbol": instrument.symbol, "exchange": instrument.exchange.code, "start_date": data["start_date"], "end_date": data["end_date"], "price_aggregate": {"observation_count": stats["count"], "minimum_close": stats["minimum"], "maximum_close": stats["maximum"], "average_close": stats["average"]}}

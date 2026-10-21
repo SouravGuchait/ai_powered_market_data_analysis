@@ -7,6 +7,7 @@ import uuid
 from django.db import transaction
 from django.utils import timezone
 
+from apps.analytics.cache import invalidate_owner_analytics
 from apps.marketdata import storage
 from apps.marketdata.ingestion.schema import InputError, IssueCode
 from apps.marketdata.jobs.ingestion.pipeline import IngestionOutcome, build_dataset
@@ -104,6 +105,7 @@ def _complete(job: IngestionJob, outcome: IngestionOutcome) -> None:
     if not updated:
         logger.warning("ingestion.job.completion_lost job_id=%s", job.pk)
         return
+    invalidate_owner_analytics(job.created_by)
     logger.info(
         "ingestion.job.completed job_id=%s received=%d accepted=%d rejected=%d duration_ms=%d",
         job.pk,

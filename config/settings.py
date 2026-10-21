@@ -160,6 +160,9 @@ else:
             "LOCATION": "marketdata-local",
         }
     }
+ANALYTICS_CACHE_TTL = env_int("ANALYTICS_CACHE_TTL", 60)
+if ANALYTICS_CACHE_TTL < 1:
+    raise ImproperlyConfigured("ANALYTICS_CACHE_TTL must be positive")
 
 CELERY_BROKER_URL = env("CELERY_BROKER_URL") or env("REDIS_URL")
 if not CELERY_BROKER_URL:
@@ -173,6 +176,27 @@ CELERY_RESULT_BACKEND = None
 CELERY_TASK_SERIALIZER = "json"
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TIMEZONE = env("DJANGO_TIME_ZONE", "UTC")
+CELERY_TASK_TIME_LIMIT = env_int("CELERY_TASK_TIME_LIMIT", 1800)
+CELERY_TASK_SOFT_TIME_LIMIT = env_int("CELERY_TASK_SOFT_TIME_LIMIT", 1740)
+CELERY_BEAT_SCHEDULE = {
+    "marketdata-worker-heartbeat": {
+        "task": "apps.marketdata.tasks.worker_heartbeat",
+        "schedule": 60.0,
+    },
+}
+INGESTION_DISPATCH_INTERVAL_SECONDS = env_int(
+    "INGESTION_DISPATCH_INTERVAL_SECONDS", 0
+)
+INGESTION_DISPATCH_BATCH_SIZE = env_int("INGESTION_DISPATCH_BATCH_SIZE", 100)
+if INGESTION_DISPATCH_INTERVAL_SECONDS < 0:
+    raise ImproperlyConfigured("INGESTION_DISPATCH_INTERVAL_SECONDS cannot be negative")
+if INGESTION_DISPATCH_BATCH_SIZE < 1:
+    raise ImproperlyConfigured("INGESTION_DISPATCH_BATCH_SIZE must be positive")
+if INGESTION_DISPATCH_INTERVAL_SECONDS:
+    CELERY_BEAT_SCHEDULE["marketdata-pending-ingestion-dispatch"] = {
+        "task": "apps.marketdata.tasks.dispatch_pending_ingestion_jobs",
+        "schedule": float(INGESTION_DISPATCH_INTERVAL_SECONDS),
+    }
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},

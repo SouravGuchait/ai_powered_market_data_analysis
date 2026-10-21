@@ -8,7 +8,7 @@ Example:
     python scripts/generate_market_data.py --symbols 5 --days 100 --seed 42 \
         --output-dir sample_data
 """
-
+import secrets
 import argparse
 import json
 import logging
@@ -212,11 +212,13 @@ def generate(
     output_dir: Path,
     symbols: int = 5,
     days: int = 100,
-    seed: int = 42,
+    seed: int | None = None,
     start: date | None = None,
 ) -> dict[str, int]:
     """Write clean and dirty fixtures in all three formats; return row counts."""
-    rng = np.random.default_rng(seed)
+    resolved_seed = seed if seed is not None else secrets.randbits(32)
+    logger.info("Using synthetic-data seed=%d", resolved_seed)
+    rng = np.random.default_rng(resolved_seed)
     instruments = build_instruments(symbols)
     dates = build_dates(start or date(2024, 1, 2), days)
     rows = generate_rows(instruments, dates, rng)
@@ -265,7 +267,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="trading days per instrument (default: 100)",
     )
     parser.add_argument(
-        "--seed", type=int, default=42, help="seed for reproducible data (default: 42)"
+        "--seed",
+        type=int,
+        default=None,
+        help="seed for reproducible data (default: fresh random seed per run)",
     )
     parser.add_argument(
         "--output-dir",

@@ -81,6 +81,10 @@ local fallback. Host-provided variables win over `.env`.
 | `DB_HOST`, `DB_PORT` | `127.0.0.1`, `3306` | MySQL address |
 | `DB_TEST_NAME` | none | Test database name |
 | `CELERY_BROKER_URL` | `memory://` in DEBUG | `REDIS_URL` is accepted as a fallback; required when DEBUG is off |
+| `CELERY_TASK_TIME_LIMIT` | `1800` | Hard worker task limit in seconds |
+| `CELERY_TASK_SOFT_TIME_LIMIT` | `1740` | Soft worker task limit in seconds |
+| `INGESTION_DISPATCH_INTERVAL_SECONDS` | `0` | Beat dispatch interval; `0` disables scheduled ingestion dispatch |
+| `INGESTION_DISPATCH_BATCH_SIZE` | `100` | Maximum queued jobs selected by one scheduled dispatch tick |
 | `REDIS_CACHE_URL` | none | Unset means per-process LocMemCache |
 | `JWT_ACCESS_MINUTES` | `15` | Access-token lifetime in minutes |
 | `JWT_REFRESH_DAYS` | `7` | Refresh-token lifetime in days |
@@ -326,6 +330,120 @@ Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:8000/api/v1/jobs/$($job.id)
 
 ## Ingestion processing (milestone 05)
 
+### Start Redis, the Celery worker, and Beat
+
+Start Redis using the broker URL in `.env` (the default development broker is
+`memory://`, which cannot be shared by separate worker and Beat processes).
+For asynchronous local runs, set `CELERY_BROKER_URL=redis://127.0.0.1:6379/0`.
+Run these commands in separate PowerShell terminals from the repository root:
+
+```powershell
+docker run --rm --name marketdata-redis -p 6379:6379 redis:7
+```
+
+```powershell
+.\venv\Scripts\celery.exe -A config worker --loglevel=INFO --pool=solo
+```
+
+```powershell
+.\venv\Scripts\celery.exe -A config beat --loglevel=INFO
+```
+
+These commands run in three separate PowerShell terminals from the repository
+root: Redis, worker, and Beat. Ensure `CELERY_BROKER_URL` is set in `.env` for
+both the Django process and Celery processes. For a local Redis broker, use
+`redis://127.0.0.1:6379/0`. The worker uses `--pool=solo` for Windows-friendly
+development; Linux deployments can use Celery's default process pool.
+
+Beat dispatches `apps.marketdata.tasks.worker_heartbeat` every 60 seconds. The
+worker terminal logs `celery.worker.heartbeat` with its task ID and timestamp;
+uploaded jobs log their existing `ingestion.job.*` lifecycle events in that
+same terminal. Logs are written to the terminal's stdout/stderr. To also save
+the worker output to a file:
+
+```powershell
+.\venv\Scripts\celery.exe -A config worker --loglevel=INFO --pool=solo 2>&1 | Tee-Object -FilePath .\celery-worker.log
+```
+
+To also save Beat output, run the same pattern with `beat` and a separate
+filename. Stop a foreground process with `Ctrl+C`.
+
+### Check Celery and Redis health
+
+From another PowerShell terminal, ask workers to respond to a ping:
+
+```powershell
+.\venv\Scripts\celery.exe -A config inspect ping --timeout=5
+```
+
+A healthy worker responds with `pong`. If there is no response, check that the
+worker process is still running and that it uses the same broker URL. Inspect
+worker queues and registered tasks with:
+
+```powershell
+.\venv\Scripts\celery.exe -A config inspect active_queues
+.\venv\Scripts\celery.exe -A config inspect registered
+.\venv\Scripts\celery.exe -A config inspect stats
+```
+
+For Redis container health and logs:
+
+```powershell
+docker exec marketdata-redis redis-cli ping
+docker logs --tail 100 marketdata-redis
+docker logs --follow marketdata-redis
+```
+
+Redis should return `PONG`. The worker and Beat write logs in their own
+terminals; Beat does not provide a worker-style `inspect ping`, so check its
+process and log output for periodic sends and broker errors. The existing
+heartbeat task is sent every 60 seconds and its worker log confirms task
+delivery. For scheduled ingestion dispatch, set
+`INGESTION_DISPATCH_INTERVAL_SECONDS` to a positive number in `.env` or the
+Beat terminal's environment, then restart Beat. The default `0` disables that
+dispatcher. The configured value controls the interval; `60` is only an example.
+
+The schedule is in `config/settings.py`, and Celery discovers tasks from
+`apps/marketdata/tasks.py`. Run only one Beat instance for this schedule. See
+the milestone 11 verification below for current test and system-check results.
+
+### Scheduled ingestion dispatch (milestone 11)
+
+Set `INGESTION_DISPATCH_INTERVAL_SECONDS` to a positive number of seconds to
+add `apps.marketdata.tasks.dispatch_pending_ingestion_jobs` to the Beat
+schedule. The default `0` keeps periodic ingestion dispatch off in local
+development and tests. Each tick selects at most
+`INGESTION_DISPATCH_BATCH_SIZE` oldest `queued` jobs with no saved Celery task
+ID. It sends only the job UUID and records the returned task ID in MySQL. A
+row lock prevents concurrent dispatchers from selecting the same job; the
+worker's conditional `queued -> running` update also makes duplicate delivery
+safe. Completed, failed, cancelled, running, and already-dispatched jobs are
+not selected. Upload requests continue to enqueue their own jobs after commit.
+
+If Redis is unavailable, the selected job remains queued without a task ID and
+is eligible on the next Beat tick; a failure is logged by job ID and exception
+type. If dispatch reaches Redis but the database transaction cannot commit,
+delivery may repeat, and the worker's state guard prevents duplicate
+processing. Run one Beat instance. A worker crash after claiming a job can
+leave its MySQL status as `running`; there is no automatic stale-job reaper or
+partial-row cleanup/reset policy yet, so operator recovery is required. Do not
+reset such a job without checking and cleaning its partial writes.
+
+Celery uses JSON-only task arguments, no result backend, and configurable soft
+and hard task time limits. MySQL remains authoritative for job state. Redis
+cache outages remain non-fatal to analytics responses under the existing
+analytics cache behavior.
+
+Verification (2026-10-21):
+
+- `venv\Scripts\python.exe -m pytest -q apps\marketdata\tests\test_celery.py` - 7 passed against configured MySQL. Covers eligibility, bounded batches, repeat runs, broker failure retry on the next tick, concurrent dispatchers, test schedule disablement, and the heartbeat task.
+- `venv\Scripts\python.exe manage.py check` - no issues.
+- `venv\Scripts\ruff.exe check apps\marketdata\jobs\ingestion\dispatch.py apps\marketdata\tasks.py apps\marketdata\tests\test_celery.py config\settings.py config\settings_test.py` - all checks passed.
+
+Limitations: a live Redis worker/Beat run was not performed. Jobs already
+recorded with a task ID are not re-dispatched if a broker loses their message,
+and running jobs are not automatically recovered after worker crashes.
+
 `apps.marketdata.tasks.process_ingestion_job` consumes only the job UUID that
 the upload API queued. The worker claims `queued -> running` atomically, opens
 the stored upload, processes it in bounded chunks, and records `completed` or
@@ -546,15 +664,23 @@ pagination; storage keys and raw row payloads are hidden there.
 
 ### Synthetic data
 
-Deterministic offline generator for development and testing (no database,
-Django config, or market API):
+Offline generator for development and testing (no database, Django config, or
+market API). It uses a fresh random seed per run by default:
 
 ```powershell
-.\venv\Scripts\python.exe scripts\generate_market_data.py --symbols 5 --days 100 --seed 42 --output-dir sample_data
+.\venv\Scripts\python.exe scripts\generate_market_data.py --symbols 5 --days 100 --output-dir sample_data
 ```
 
 Options: `--symbols`, `--days`, `--seed`, `--output-dir`, `--start-date`;
-`--help` lists all. Same seed produces byte-identical CSV output. It writes:
+`--help` lists all. The generated seed is logged. Pass `--seed 42` (or another
+integer) to reproduce the same values and files. Changing the seed changes
+prices and volume, but does not change the symbols or default date range.
+Because canonical prices are unique by instrument and trading date, importing
+the same clean file again still produces duplicate-record issues even when its
+prices use a new seed. Use a new `--start-date` for another import period, and
+use `synthetic_market_clean.*` for accepted fixture data. The `dirty` files
+intentionally contain invalid rows and a duplicate row for validation testing.
+It writes:
 
 | File | Content |
 | --- | --- |
@@ -567,6 +693,30 @@ Rows always contain the documented columns `exchange, symbol, name,
 asset_class, currency, timestamp, open, high, low, close, adjusted_close,
 volume`; `timestamp` is an ISO date string. Dirty files stay distinguishable
 by name, and the clean files are asserted corruption-free at generation time.
+
+Verification (2026-10-21): `venv\Scripts\python.exe -m pytest -q
+apps\marketdata\tests\test_generator.py` - 9 passed;
+`venv\Scripts\ruff.exe check scripts\generate_market_data.py` - all checks
+passed; `venv\Scripts\python.exe manage.py check` - no issues. Two no-seed
+generation runs produced different clean CSV hashes; the test suite confirms
+explicit seeds remain reproducible.
+
+The generator's exchange and instrument descriptors can also seed the
+application database. This creates the three exchanges and the first ten
+generator-mapped instruments, with asset classes and currencies assigned by
+the same generator logic:
+
+```powershell
+.\venv\Scripts\python.exe manage.py seed_market_reference_data
+```
+
+The command is repeatable and updates metadata for matching exchange/symbol
+rows to the generator values. It does not create price records. These symbols
+are synthetic fixtures, not a complete real-market instrument directory.
+Verified against the configured MySQL database on 2026-10-21: 2 exchanges and
+8 instruments created; 1 exchange and 2 instruments updated. A follow-up ORM
+query confirmed all 3 exchanges and 10 instruments with the expected names,
+timezones, asset classes, and currencies.
 
 ### Ownership
 
@@ -591,8 +741,10 @@ job, so existence is not disclosed. The cross-user cases are covered by
   value validation, canonical normalization, metric hook
 - `apps/marketdata/jobs/ingestion/` - queue dispatch, persistence, bounded
   dataset pipeline, worker claim/completion/cleanup
+- `apps/marketdata/management/commands/seed_market_reference_data.py` - seed
+  generator-matched exchange and instrument reference rows
 - `apps/marketdata/tests/integration/` - real Celery broker connectivity probe
-- `scripts/generate_market_data.py` - deterministic synthetic OHLCV fixtures
+- `scripts/generate_market_data.py` - synthetic OHLCV fixtures with an optional reproducible seed
 - `sample_data/` - optional local example output of the generator (not committed)
 - `manage.py` - command entrypoint
 - `pytest.ini` - `DJANGO_SETTINGS_MODULE=config.settings_test`, tests under `apps/`
@@ -855,4 +1007,25 @@ Verification (2026-10-21):
 - `venv\Scripts\python.exe -m pytest apps\analytics\tests\test_api.py::test_job_issues_are_owner_scoped_and_paginated -q` - 1 passed against configured MySQL.
 
 Limitations: the ten-year bound is calendar days; this API has no shared-dataset
-permission model, metric caching, or historical-correction recomputation.
+permission model or historical-correction recomputation.
+
+## Analytics response cache (milestone 11)
+
+Successful analytics series and summary GET responses are cached as JSON
+primitives for `ANALYTICS_CACHE_TTL` seconds (default 60). Keys include the
+authenticated user, normalized query filters, endpoint, and cache generation.
+When an ingestion job completes after persistence and metric calculation, its
+owner's generation advances so subsequent analytics requests read MySQL-backed
+results. Redis is disposable; cache read, write, or invalidation errors fall
+back to calculating from MySQL. The Redis cache uses the configured cache DB,
+separate from the Celery broker DB. This cache has no stampede lock, and failed
+invalidation can leave old responses visible until the short TTL expires.
+
+Verification for the cache change:
+
+- `venv\Scripts\ruff.exe check apps\analytics\cache.py apps\analytics\api.py apps\analytics\tests\test_api.py apps\marketdata\jobs\ingestion\process.py config\settings.py` - passed.
+- `venv\Scripts\python.exe manage.py check` - no issues.
+- Cache helper test for user/filter key separation - 1 passed.
+- MySQL-backed cache endpoint tests for hit, changed filters, invalidation, and Redis failure fallback - 2 passed.
+- Redis broker integration probe - skipped because the configured broker is not Redis/available in this run.
+- A full analytics API test run still has 6 failures in pre-existing response/optional-filter expectations, outside this cache change; 3 other tests passed. The new cache tests pass independently.
