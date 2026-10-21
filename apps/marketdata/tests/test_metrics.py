@@ -5,14 +5,17 @@ import pytest
 
 from apps.marketdata.ingestion.metrics import (
     calculate_daily_returns,
+    calculate_drawdowns,
     calculate_moving_average,
     calculate_rolling_volatility,
     iter_daily_returns,
+    iter_drawdowns,
     iter_moving_averages,
     iter_rolling_volatility,
 )
 from apps.marketdata.jobs.ingestion.metrics import (
     DailyReturnCalculator,
+    MaximumDrawdownCalculator,
     MovingAverageCalculator,
     RollingVolatilityCalculator,
 )
@@ -153,6 +156,74 @@ def test_moving_average_insufficient_empty_and_duplicate_observations():
     repeated = pd.concat([short, short.iloc[[0]]], ignore_index=True)
     with pytest.raises(ValueError, match="duplicate"):
         calculate_moving_average(repeated)
+
+
+def test_drawdowns_track_peak_trough_recovery_and_new_high():
+    frame = pd.DataFrame(
+        [("A", f"2026-01-0{i}", str(close)) for i, close in enumerate((100, 80, 90, 110, 55), 1)],
+        columns=["symbol", "timestamp", "close"],
+    )
+    values, peaks, minima = calculate_drawdowns(frame)
+    assert values.tolist() == [0.0, -0.2, -0.2, -0.2, -0.5]
+    assert peaks == {"A": Decimal(110)}
+    assert minima == {"A": Decimal("-0.5")}
+
+
+def test_drawdown_symbols_invalids_chunks_empty_and_period_reset():
+    chunks = [
+        pd.DataFrame(
+            [("A", "1", "100"), ("B", "1", "20"), ("A", "2", None)],
+            columns=["symbol", "timestamp", "close"],
+        ),
+        pd.DataFrame(
+            [("A", "3", "50"), ("B", "2", "20"), ("B", "3", "25")],
+            columns=["symbol", "timestamp", "close"],
+        ),
+    ]
+    result = list(iter_drawdowns(chunks))
+    assert result[0][1].iloc[:2].tolist() == [0.0, 0.0]
+    assert pd.isna(result[0][1].iloc[2])
+    assert result[1][1].tolist() == [-0.5, 0.0, 0.0]
+    fresh, _, _ = calculate_drawdowns(chunks[1])
+    assert fresh.tolist() == [0.0, 0.0, 0.0]
+    empty, peaks, minima = calculate_drawdowns(
+        pd.DataFrame(columns=["symbol", "timestamp", "close"])
+    )
+    assert empty.empty and peaks == minima == {}
+    repeated = pd.concat([chunks[0].iloc[[0]], chunks[0].iloc[[0]]], ignore_index=True)
+    with pytest.raises(ValueError, match="duplicate"):
+        calculate_drawdowns(repeated)
+
+
+@pytest.mark.django_db
+def test_drawdown_persists_job_period_only_and_is_repeatable(instrument, job):
+    for day, close in enumerate((100, 50), start=1):
+        PriceRecord.objects.create(
+            instrument=instrument, ingestion_job=job,
+            trading_date=f"2024-01-0{day}", open=close, high=close,
+            low=close, close=close, volume=0,
+        )
+    current_job = IngestionJob.objects.create(source_type="csv")
+    for day, close in ((3, 80), (4, 100), (5, 60)):
+        PriceRecord.objects.create(
+            instrument=instrument, ingestion_job=current_job,
+            trading_date=f"2024-01-0{day}", open=close, high=close,
+            low=close, close=close, volume=0,
+        )
+
+    calculator = MaximumDrawdownCalculator()
+    calculator.on_job_completed(job=current_job)
+    calculator.on_job_completed(job=current_job)
+    snapshots = list(MetricSnapshot.objects.filter(
+        instrument=instrument, metric_type=MetricSnapshot.MetricType.MAX_DRAWDOWN
+    ).order_by("as_of_date"))
+    assert [snapshot.value for snapshot in snapshots] == [
+        Decimal("0E-8"), Decimal("0E-8"), Decimal("-0.40000000")
+    ]
+    assert snapshots[-1].metadata == {
+        "units": "fraction", "price_basis": "close", "period": "ingestion_job",
+        "window_type": "cumulative_observations",
+    }
 
 
 @pytest.mark.django_db
