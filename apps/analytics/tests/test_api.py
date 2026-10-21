@@ -55,8 +55,28 @@ def test_daily_returns_use_prior_observation_and_inclusive_range(owner, market):
         "symbol": "aaa", "exchange": "xnys", "start_date": "2024-01-03", "end_date": "2024-01-04"
     })
     assert response.status_code == 200
-    assert response.data["count"] == 2
+    assert "count" not in response.data
+    assert "next" not in response.data
+    assert "previous" not in response.data
+    assert len(response.data["results"]) == 2
     assert [row["value"] for row in response.data["results"]] == [round(102 / 101 - 1, 8), round(103 / 102 - 1, 8)]
+    assert response.data["results"][0]["date"].isoformat() == "2024-01-03"
+
+
+@pytest.mark.django_db
+def test_daily_returns_skip_invalid_latest_prior_close(owner, market):
+    instrument, job = market
+    PriceRecord.objects.create(
+        instrument=instrument, ingestion_job=job, trading_date="2023-12-31",
+        open=90, high=90, low=90, close=90, volume=1,
+    )
+    client = APIClient()
+    client.force_authenticate(owner)
+    response = client.get("/api/v1/analytics/daily-returns/", {
+        "symbol": "AAA", "exchange": "XNYS", "start_date": "2024-01-01", "end_date": "2024-01-01",
+    })
+    assert response.status_code == 200
+    assert response.data["results"][0]["value"] == round(100 / 90 - 1, 8)
 
 
 @pytest.mark.django_db
@@ -65,7 +85,7 @@ def test_analytics_without_filters_returns_all_owned_records(owner, market):
     client.force_authenticate(owner)
     series = client.get("/api/v1/analytics/daily-returns/")
     assert series.status_code == 200
-    assert series.data["count"] == 25
+    assert len(series.data["results"]) == 25
     assert series.data["symbol"] is None
     assert series.data["results"][0]["value"] is None
     assert series.data["results"][0]["symbol"] == "AAA"
@@ -139,7 +159,7 @@ def test_analytics_requires_auth_and_is_owner_scoped(owner, market):
     client = APIClient()
     client.force_authenticate(stranger)
     assert client.get(url).status_code == 400
-    assert client.get("/api/v1/analytics/daily-returns/").data["count"] == 0
+    assert client.get("/api/v1/analytics/daily-returns/").data["results"] == []
     assert client.get("/api/v1/analytics/summary/").data["price_aggregate"]["observation_count"] == 0
 
 
@@ -152,7 +172,7 @@ def test_moving_average_uses_preceding_window_and_paginates(owner, market):
         "window": "5", "page_size": "1",
     })
     assert response.status_code == 200
-    assert response.data["count"] == 2
+    assert len(response.data["results"]) == 2
     assert response.data["window"] == 5
     assert response.data["results"][0]["value"] == 103.0
 
