@@ -17,6 +17,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.analytics.api import issues
+from apps.analytics.serializers import ValidationIssuePageSerializer
 from apps.marketdata.jobs.ingestion.dispatch import (
     IngestionEnqueueError,
     enqueue_after_commit,
@@ -187,6 +189,15 @@ class JobDetailView(APIView):
             IngestionJob.objects.filter(created_by=request.user), pk=job_id
         )
         return Response(IngestionJobSerializer(job).data)
+
+
+class JobIssuesView(APIView):
+    permission_classes = [IsAuthenticated]  # noqa: RUF012
+
+    @extend_schema(responses=ValidationIssuePageSerializer)
+    def get(self, request, job_id):
+        job = get_object_or_404(IngestionJob.objects.filter(created_by=request.user), pk=job_id)
+        return issues(request, job)
 
 
 def _read_upload(request) -> UploadInput:
