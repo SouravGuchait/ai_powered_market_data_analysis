@@ -6,7 +6,8 @@ authentication, the market-data ORM schema (ingestion jobs, files,
 exchanges/instruments, daily price records, validation issues, audit events,
 metric snapshots), a synthetic-data generator, the upload API with durable
 job records and owner-scoped status, and bounded CSV/JSON/XLSX ingestion
-processing. Metric formulas and analytics are not implemented yet.
+processing. Daily returns and simple moving averages are calculated after
+ingestion and stored as `MetricSnapshot` rows.
 
 ## Requirements
 
@@ -448,6 +449,30 @@ Daily-return verification on 2026-10-20:
 - `venv\\Scripts\\python.exe -m pytest -q apps/marketdata/tests/test_metrics.py` - 7 passed.
 - `venv\\Scripts\\python.exe manage.py check` - no issues.
 - `venv\\Scripts\\ruff.exe check apps/marketdata/ingestion/metrics.py apps/marketdata/jobs/ingestion/metrics.py apps/marketdata/jobs/ingestion/pipeline.py apps/marketdata/tests/test_metrics.py` - all checks passed.
+
+### Simple moving averages (milestone 07)
+
+The ingestion completion hook also stores a five-observation simple moving
+average of canonical close prices. The observation window is per instrument,
+ordered by trading date; calendar gaps do not change its size. Invalid closes
+are skipped by the pure calculator, while canonical `PriceRecord` closes are
+positive by database constraint. The first four observations have no snapshot.
+Snapshots use `metric_type=moving_average`, `lookback_days=5`, version `1`,
+and metadata `{"units":"price","window_type":"observations"}`. As with
+daily returns, complete canonical history is streamed in bounded ORM batches
+and only rows from the completed job receive snapshots. The natural key makes
+reprocessing idempotent.
+
+Moving-average verification on 2026-10-21:
+
+- `venv\\Scripts\\python.exe -m pytest -q apps/marketdata/tests/test_metrics.py` - 11 passed against configured MySQL.
+- `venv\\Scripts\\python.exe manage.py check` - no issues.
+- `venv\\Scripts\\ruff.exe check apps/marketdata/ingestion/metrics.py apps/marketdata/jobs/ingestion/metrics.py apps/marketdata/jobs/ingestion/pipeline.py apps/marketdata/tests/test_metrics.py` - all checks passed.
+
+The SMA window defaults to five; callers of the pure calculator and persistence
+class can supply another positive window. Existing snapshots are not refreshed
+if canonical history is later corrected; a correction workflow is outside this
+milestone.
 
 Worker logs include the job ID, source type, chunk and batch sizes, received/
 accepted/rejected counts, issue count, duration, and a failure category. Raw

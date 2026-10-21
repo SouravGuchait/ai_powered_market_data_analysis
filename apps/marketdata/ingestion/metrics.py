@@ -1,5 +1,6 @@
 """Pure, chunk-aware market metric calculations."""
 
+from collections import deque
 from collections.abc import Iterable
 from decimal import Decimal
 from typing import Protocol
@@ -65,3 +66,48 @@ def iter_daily_returns(
     for chunk in chunks:
         returns, previous = calculate_daily_returns(chunk, previous)
         yield chunk, returns
+
+
+def calculate_moving_average(
+    frame: pd.DataFrame,
+    window: int = 5,
+    previous_closes: dict[str, list[Decimal]] | None = None,
+) -> tuple[pd.Series, dict[str, list[Decimal]]]:
+    """Calculate an observation-based full-window SMA in original row order."""
+    if window < 1:
+        raise ValueError("window must be positive")
+    state = {
+        symbol: deque(values[-(window - 1) :] if window > 1 else [], maxlen=window)
+        for symbol, values in (previous_closes or {}).items()
+    }
+    values = pd.Series(float("nan"), index=frame.index, dtype="float64")
+    if frame.empty:
+        return values, {symbol: list(closes) for symbol, closes in state.items()}
+
+    ordered = frame.assign(_position=range(len(frame))).sort_values(
+        ["symbol", "timestamp"], kind="stable"
+    )
+    if ordered.duplicated(["symbol", "timestamp"]).any():
+        raise ValueError("duplicate symbol/timestamp observations")
+    for symbol_value, close_value, position in ordered[
+        ["symbol", "close", "_position"]
+    ].itertuples(index=False, name=None):
+        symbol = str(symbol_value)
+        close = _positive_decimal(close_value)
+        if close is None:
+            continue
+        closes = state.setdefault(symbol, deque(maxlen=window))
+        closes.append(close)
+        if len(closes) == window:
+            values.iloc[int(position)] = float(sum(closes) / Decimal(window))
+    return values, {symbol: list(closes) for symbol, closes in state.items()}
+
+
+def iter_moving_averages(
+    chunks: Iterable[pd.DataFrame], window: int = 5
+) -> Iterable[tuple[pd.DataFrame, pd.Series]]:
+    """Yield SMA values with at most window-1 closes retained per symbol."""
+    previous: dict[str, list[Decimal]] = {}
+    for chunk in chunks:
+        averages, previous = calculate_moving_average(chunk, window, previous)
+        yield chunk, averages
