@@ -430,9 +430,24 @@ issue.
 - The processing package imports no Django request objects or views. Parsing and
   normalization (`apps/marketdata/ingestion/`) are ORM-free; persistence and job
   orchestration live under `apps/marketdata/jobs/ingestion/`.
-- Metric formulas are not implemented. `apps/marketdata/ingestion/metrics.py`
-  defines the `MetricCalculator` hook called once after a job's rows are
-  committed.
+- Daily fractional returns are calculated in
+  `apps/marketdata/ingestion/metrics.py` and persisted by
+  `apps/marketdata/jobs/ingestion/metrics.py` after accepted rows are committed.
+  Returns are `close / prior_close - 1`, grouped by symbol and ordered by date;
+  chunk state carries the last valid close. Invalid/missing closes do not
+  advance state, so a return can span an invalid observation. Duplicate
+  symbol/date observations are rejected by the pure calculator, and canonical
+  persisted dates are unique per instrument. Snapshots are stored as fractions
+  at eight decimal places. The first observation has no snapshot because its
+  return is undefined and `MetricSnapshot.value` is non-null. The calculator
+  reads complete canonical history in bounded ORM batches and stores values
+  only for the completed job's rows.
+
+Daily-return verification on 2026-10-20:
+
+- `venv\\Scripts\\python.exe -m pytest -q apps/marketdata/tests/test_metrics.py` - 7 passed.
+- `venv\\Scripts\\python.exe manage.py check` - no issues.
+- `venv\\Scripts\\ruff.exe check apps/marketdata/ingestion/metrics.py apps/marketdata/jobs/ingestion/metrics.py apps/marketdata/jobs/ingestion/pipeline.py apps/marketdata/tests/test_metrics.py` - all checks passed.
 
 Worker logs include the job ID, source type, chunk and batch sizes, received/
 accepted/rejected counts, issue count, duration, and a failure category. Raw

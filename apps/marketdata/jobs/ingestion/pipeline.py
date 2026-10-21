@@ -10,6 +10,7 @@ from apps.marketdata.ingestion.metrics import MetricCalculator
 from apps.marketdata.ingestion.normalize import normalize_chunk
 from apps.marketdata.ingestion.parsing import iter_input_chunks
 from apps.marketdata.ingestion.schema import InputError, IssueCode
+from apps.marketdata.jobs.ingestion.metrics import DailyReturnCalculator
 from apps.marketdata.jobs.ingestion.persist import (
     InstrumentResolver,
     persist_issues,
@@ -107,8 +108,7 @@ def build_dataset(
         rows_accepted=accepted,
         rows_rejected=rejected,
     )
-    if metric_calculator is not None:
-        metric_calculator.on_job_completed(job=job)
+    (metric_calculator or DailyReturnCalculator()).on_job_completed(job=job)
 
     duration_ms = int((time.monotonic() - started) * 1000)
     logger.info(
