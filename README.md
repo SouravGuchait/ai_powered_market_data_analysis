@@ -807,9 +807,10 @@ snapshots. There is no fixed lookback requirement for this cumulative metric.
 
 Verification (2026-10-21):
 
-- `venv\Scripts\python.exe -m pytest -q apps/marketdata/tests/test_metrics.py` - 14 passed against MySQL.
+- `venv\Scripts\python.exe -m pytest -q apps/marketdata/tests/test_metrics.py` - 19 passed against MySQL.
 - `venv\Scripts\python.exe manage.py check` - no issues.
 - `venv\Scripts\ruff.exe check apps\marketdata\ingestion\metrics.py apps\marketdata\jobs\ingestion\metrics.py apps\marketdata\tests\test_metrics.py` - all checks passed.
+- `venv\Scripts\basedpyright.exe apps\marketdata\jobs\ingestion\metrics.py` - 0 errors; 59 existing Django/ORM typing warnings.
 
 Limitations: existing snapshots are not recomputed if canonical rows are later
 corrected. The cumulative period is the ingestion job, not all historical rows
