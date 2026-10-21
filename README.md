@@ -492,7 +492,7 @@ historical variation and is not a forecast or guarantee.
 
 Volatility verification on 2026-10-21:
 
-- `venv\Scripts\python.exe -m pytest -q apps/marketdata/tests/test_metrics.py` - 16 passed against configured MySQL.
+- `venv\Scripts\python.exe -m pytest -q apps/marketdata/tests/test_metrics.py` - 19 passed against configured MySQL (run with local database access enabled).
 - `venv\Scripts\python.exe manage.py check` - no issues.
 - `venv\Scripts\ruff.exe check apps/marketdata/ingestion/metrics.py apps/marketdata/jobs/ingestion/metrics.py apps/marketdata/tests/test_metrics.py` - all checks passed.
 
@@ -815,3 +815,44 @@ Verification (2026-10-21):
 Limitations: existing snapshots are not recomputed if canonical rows are later
 corrected. The cumulative period is the ingestion job, not all historical rows
 for an instrument; the metric does not estimate future performance.
+
+## Analytics API (milestone 10)
+
+The `apps/analytics/` Django app exposes authenticated, owner-scoped endpoints
+under `/api/v1/analytics/` for daily returns, moving averages, rolling
+volatility, drawdown, and raw-price summary aggregates. All filters are
+optional. Without filters, series endpoints cover all price history owned by
+the authenticated user across all symbols; each result identifies its symbol
+and exchange. Date filters are inclusive. Results remain paginated, and metric
+calculation streams ORM rows in 1,000-row chunks. Explicit two-sided date
+ranges are limited to 3,660 days. Moving averages and volatility accept windows
+5 and 20; volatility defaults to 20 observations and reports annualized
+fractional units, sample standard deviation, and 252 annualization days.
+Pages contain at most 100 results. The maximum drawdown series starts its
+running peak at the requested period. `GET /api/v1/jobs/{id}/issues/` provides
+owner-scoped paginated issues with optional `issue_code` filtering.
+The `issue_code` query parameter filters the model's `error_code` field; issue
+results expose that field as `error_code`.
+
+Analytical series are computed on demand by calling the existing Pandas
+functions. The API filters canonical `PriceRecord` rows through the requesting
+user's ingestion jobs and streams history in bounded chunks to preserve metric
+state. It does not read `MetricSnapshot`: snapshots do not carry an ownership
+reference, so using them could expose data computed from another user's
+records. The summary returns database-side close count,
+minimum, maximum, and average, labeled as raw-price aggregates.
+
+Verification (2026-10-21):
+
+- `venv\Scripts\python.exe -m pytest -q apps/analytics/tests/test_api.py apps/marketdata/tests/test_metrics.py` - 28 passed against configured MySQL.
+- `venv\Scripts\python.exe manage.py check` - no issues.
+- `venv\Scripts\python.exe manage.py makemigrations --check --dry-run` - no changes detected; Django emitted a warning that it could not connect to MySQL to check migration history in the sandbox.
+- `venv\Scripts\python.exe manage.py spectacular --file $env:TEMP\analytics-schema.yaml` - exit 0, schema generated.
+- `venv\Scripts\ruff.exe check apps\analytics apps\marketdata\views.py apps\marketdata\urls.py config\urls.py config\settings.py` - all checks passed.
+- `venv\Scripts\basedpyright.exe apps\analytics\api.py` - 0 errors, 49 warnings remain, mostly missing Pandas/DRF stubs and dynamic ORM types.
+- `venv\Scripts\pyrefly.exe check apps\analytics\api.py` - 0 errors.
+- `venv\Scripts\ruff.exe check apps\analytics\api.py` - all checks passed.
+- `venv\Scripts\python.exe -m pytest apps\analytics\tests\test_api.py::test_job_issues_are_owner_scoped_and_paginated -q` - 1 passed against configured MySQL.
+
+Limitations: the ten-year bound is calendar days; this API has no shared-dataset
+permission model, metric caching, or historical-correction recomputation.
