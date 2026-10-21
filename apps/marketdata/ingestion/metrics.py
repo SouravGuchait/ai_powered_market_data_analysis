@@ -111,3 +111,51 @@ def iter_moving_averages(
     for chunk in chunks:
         averages, previous = calculate_moving_average(chunk, window, previous)
         yield chunk, averages
+
+
+def calculate_drawdowns(
+    frame: pd.DataFrame,
+    peaks: dict[str, Decimal] | None = None,
+    minimum_drawdowns: dict[str, Decimal] | None = None,
+) -> tuple[pd.Series, dict[str, Decimal], dict[str, Decimal]]:
+    """Return running maximum drawdown per symbol, preserving input row order.
+
+    The running peak and worst drawdown are cumulative across the selected
+    period. Invalid or non-positive closes are skipped; repeated observations
+    for a symbol and timestamp are rejected.
+    """
+    running_peaks = dict(peaks or {})
+    minima = dict(minimum_drawdowns or {})
+    values = pd.Series(float("nan"), index=frame.index, dtype="float64")
+    if frame.empty:
+        return values, running_peaks, minima
+
+    ordered = frame.assign(_position=range(len(frame))).sort_values(
+        ["symbol", "timestamp"], kind="stable"
+    )
+    if ordered.duplicated(["symbol", "timestamp"]).any():
+        raise ValueError("duplicate symbol/timestamp observations")
+    for symbol_value, close_value, position in ordered[
+        ["symbol", "close", "_position"]
+    ].itertuples(index=False, name=None):
+        symbol = str(symbol_value)
+        close = _positive_decimal(close_value)
+        if close is None:
+            continue
+        peak = max(running_peaks.get(symbol, close), close)
+        drawdown = (close - peak) / peak
+        running_peaks[symbol] = peak
+        minima[symbol] = min(minima.get(symbol, drawdown), drawdown)
+        values.iloc[int(position)] = float(minima[symbol])
+    return values, running_peaks, minima
+
+
+def iter_drawdowns(
+    chunks: Iterable[pd.DataFrame],
+) -> Iterable[tuple[pd.DataFrame, pd.Series]]:
+    """Yield cumulative running maximum drawdowns across chunks."""
+    peaks: dict[str, Decimal] = {}
+    minima: dict[str, Decimal] = {}
+    for chunk in chunks:
+        values, peaks, minima = calculate_drawdowns(chunk, peaks, minima)
+        yield chunk, values

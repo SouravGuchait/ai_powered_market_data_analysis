@@ -750,10 +750,38 @@ against MySQL 8; no SQLite ingestion run was made.
   characters per value.
 - Cross-job write races are handled by the unique constraint plus
   `INSERT IGNORE`; a row lost only to that race is counted rejected without an
-  individual issue. Metrics are not calculated or persisted yet; only the
-  `MetricCalculator` hook exists.
+  individual issue. Metric snapshots are calculated after job completion as
+  documented below.
 - `sample_data/` was generated as an example; the repository does not track it.
 - No Docker, deployment, or AWS configuration; `gunicorn` is listed for Linux
   container serving but was not run on Windows.
 - Changing `AUTH_USER_MODEL` after a database has production data requires a
   migration plan; this milestone assumes no production data.
+
+## Maximum drawdown (milestone 09)
+
+After ingestion completes, the metric hook stores the cumulative running
+maximum drawdown for each accepted row in that ingestion job. It reads canonical
+`PriceRecord` rows in instrument/date order and carries each instrument's peak
+and minimum drawdown through bounded ORM iterator batches. The period resets
+for each job, and snapshots are written in bounded `bulk_create` batches.
+Values are negative fractions (for example, `-0.25` means `-25%`); metadata
+records `close` as the price basis and the job as the period. The calculation
+uses close prices, so dividends and splits are not included. Reprocessing is
+idempotent for the same canonical rows through the existing snapshot unique
+key and conflict-ignore persistence.
+
+The pure calculation helpers in `apps/marketdata/ingestion/metrics.py` also
+support streaming chunks, per-symbol state, and invalid close skipping.
+Duplicate symbol/date observations are rejected. Empty periods create no
+snapshots. There is no fixed lookback requirement for this cumulative metric.
+
+Verification (2026-10-21):
+
+- `venv\Scripts\python.exe -m pytest -q apps/marketdata/tests/test_metrics.py` - 14 passed against MySQL.
+- `venv\Scripts\python.exe manage.py check` - no issues.
+- `venv\Scripts\ruff.exe check apps\marketdata\ingestion\metrics.py apps\marketdata\jobs\ingestion\metrics.py apps\marketdata\tests\test_metrics.py` - all checks passed.
+
+Limitations: existing snapshots are not recomputed if canonical rows are later
+corrected. The cumulative period is the ingestion job, not all historical rows
+for an instrument; the metric does not estimate future performance.
