@@ -4,18 +4,16 @@ from rest_framework import serializers
 class AnalyticsPointSerializer(serializers.Serializer):
     date = serializers.DateField()
     value = serializers.FloatField(allow_null=True)
-    symbol = serializers.CharField()
-    exchange = serializers.CharField()
 
 
 class AnalyticsSeriesSerializer(serializers.Serializer):
     results = AnalyticsPointSerializer(many=True)
-    symbol = serializers.CharField(allow_null=True)
-    exchange = serializers.CharField(allow_null=True)
-    start_date = serializers.DateField(allow_null=True)
-    end_date = serializers.DateField(allow_null=True)
-    metric = serializers.CharField()
-    units = serializers.CharField()
+    symbol = serializers.CharField()
+    exchange = serializers.CharField()
+    start_date = serializers.DateField()
+    end_date = serializers.DateField()
+    metric = serializers.ChoiceField(choices=("daily_return", "moving_average", "rolling_volatility", "max_drawdown"))
+    units = serializers.ChoiceField(choices=("fraction", "price", "annualized_fraction"))
     window = serializers.IntegerField(required=False)
     annualized = serializers.BooleanField(required=False)
     annualization_days = serializers.IntegerField(required=False)

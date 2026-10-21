@@ -134,7 +134,7 @@ Integration probes override `DATABASES` with SQLite explicitly.
 | `POST` | `/api/v1/auth/token/refresh/` | public, throttled | Rotates the refresh token; `200` |
 | `POST` | `/api/v1/auth/logout/` | public, throttled | Blacklists `refresh`; `200` |
 | `GET` | `/api/v1/auth/me/` | Bearer access token | Current user |
-| `GET` | `/api/schema/`, `/api/docs/` | public when enabled | OpenAPI schema and Swagger UI |
+| `GET` | `/api/schema/`, `/api/docs/` | public when enabled | OpenAPI JSON and Swagger UI; both require `SERVE_API_DOCS=true` outside `DEBUG` |
 | - | `/admin/` | staff session | Django admin |
 
 All other DRF views default to `IsAuthenticated`.
@@ -1031,6 +1031,33 @@ Earlier milestone 10 verification (2026-10-21):
 
 Limitations: the ten-year bound is calendar days; this API has no shared-dataset
 permission model or historical-correction recomputation.
+
+## OpenAPI documentation (milestone 12)
+
+The drf-spectacular schema documents the implemented auth, upload, job, issue,
+and analytics routes, including authentication, query parameters, response and
+error shapes, upload limits, job states, pagination, synthetic examples, and
+metric units/window semantics. `GET /api/schema/` serves the OpenAPI document
+and `GET /api/docs/` serves Swagger UI when `SERVE_API_DOCS` is enabled. It
+defaults to `DEBUG`, so production can leave docs disabled unless explicitly
+enabled. Generate and validate locally with
+`python manage.py spectacular --file <temp-file> --validate --fail-on-warn`;
+the pytest suite includes this check for CI.
+
+Verification (2026-10-21):
+
+- `venv\Scripts\python.exe -m pytest -q apps\analytics\tests\test_openapi_schema.py` - 1 passed; generates the schema, fails on warnings, validates OpenAPI, and checks documented paths/statuses.
+- `venv\Scripts\python.exe manage.py spectacular --file openapi-check.yaml --validate --fail-on-warn` - exit 0; no schema warnings or errors. The temporary output was removed after inspection.
+- `venv\Scripts\python.exe manage.py check` - no issues.
+- `venv\Scripts\ruff.exe check apps\accounts\views.py apps\marketdata\views.py apps\marketdata\serializers.py apps\analytics\views.py apps\analytics\serializers.py` - passed.
+- `git diff --check` - passed.
+
+Limitations: route availability follows `SERVE_API_DOCS`; production deployments
+must set it explicitly if public interactive docs are intended. Schema
+generation and Django system checks do not exercise database-backed endpoint
+behavior. This repository has no checked-in CI workflow; the pytest schema
+contract test is ready for the project's CI runner but is not yet scheduled by
+one here.
 
 ## Analytics response cache (milestone 11)
 

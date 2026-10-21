@@ -6,6 +6,8 @@ from apps.marketdata.models import IngestionJob
 class IngestionJobSerializer(serializers.ModelSerializer):
     """Owner-facing job status; internal storage and task state stay private."""
 
+    status = serializers.ChoiceField(choices=IngestionJob.Status.choices)
+
     class Meta:
         model = IngestionJob
         fields = (
@@ -33,3 +35,12 @@ class UploadAcceptedSerializer(serializers.Serializer):
 class UploadRequestSerializer(serializers.Serializer):
     file = serializers.FileField()
     idempotency_key = serializers.CharField(required=False, max_length=64)
+
+
+class UploadErrorDetailSerializer(serializers.Serializer):
+    code = serializers.CharField()
+    message = serializers.CharField()
+
+
+class UploadErrorSerializer(serializers.Serializer):
+    error = UploadErrorDetailSerializer()

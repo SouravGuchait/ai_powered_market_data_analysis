@@ -10,7 +10,13 @@ from django.core.files.uploadedfile import UploadedFile
 from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import (
+    OpenApiExample,
+    OpenApiParameter,
+    OpenApiResponse,
+    extend_schema,
+)
 from rest_framework import status as http_status
 from rest_framework.exceptions import ParseError, UnsupportedMediaType
 from rest_framework.permissions import IsAuthenticated
@@ -27,6 +33,7 @@ from apps.marketdata.models import IngestionFile, IngestionJob
 from apps.marketdata.serializers import (
     IngestionJobSerializer,
     UploadAcceptedSerializer,
+    UploadErrorSerializer,
     UploadRequestSerializer,
 )
 from apps.marketdata.storage import (
@@ -64,7 +71,22 @@ class UploadView(APIView):
     permission_classes = [IsAuthenticated]  # noqa: RUF012
     @extend_schema(
         request=UploadRequestSerializer,
-        responses={202: UploadAcceptedSerializer},
+        responses={
+            202: UploadAcceptedSerializer,
+            400: UploadErrorSerializer,
+            401: OpenApiResponse(response=OpenApiTypes.OBJECT, description="Authentication required."),
+            413: OpenApiResponse(response=UploadErrorSerializer, description="Upload exceeds MAX_UPLOAD_SIZE_BYTES (default 50 MiB)."),
+            415: OpenApiResponse(response=UploadErrorSerializer, description="Unsupported file type or media type."),
+            503: OpenApiResponse(response=UploadErrorSerializer, description="Storage, persistence, or queue failure."),
+            500: UploadErrorSerializer,
+        },
+        examples=[OpenApiExample("Synthetic CSV upload", value={"file": "exchange,symbol,name,asset_class,currency,timestamp,open,high,low,close,adjusted_close,volume\\nXNAS,SYN1,Synthetic One,equity,USD,2024-01-02,10,11,9,10,10,1000\\n"}, request_only=True)],
+        description=("Accepts one CSV, JSON, or XLSX file as multipart form field `file`; optional idempotency key is "
+                     "accepted in the `Idempotency-Key` header or `idempotency_key` form field (1-64 characters). "
+                     "Raw-body upload is also supported with `X-Filename` and the media type. CSV/JSON must be UTF-8. "
+                     "Maximum size is configured by MAX_UPLOAD_SIZE_BYTES (default 52,428,800 bytes / 50 MiB). "
+                     "Returns 202 and a job location; the worker transitions queued -> running -> completed or failed, "
+                     "and queued/running jobs may also become cancelled. Replaying an owner's key returns the same job."),
     )
     def post(self, request):
         started = time.monotonic()
@@ -183,7 +205,7 @@ class UploadView(APIView):
 
 class JobDetailView(APIView):
     permission_classes = [IsAuthenticated]  # noqa: RUF012
-    @extend_schema(responses=IngestionJobSerializer)
+    @extend_schema(responses={200: IngestionJobSerializer, 401: OpenApiResponse(response=OpenApiTypes.OBJECT, description="Authentication required."), 404: OpenApiResponse(response=OpenApiTypes.OBJECT, description="Job not found for this user.")}, description="Returns the authenticated user's job status and safe summary fields. Status values: queued, running, completed, failed, cancelled.")
     def get(self, request, job_id):
         job = get_object_or_404(
             IngestionJob.objects.filter(created_by=request.user), pk=job_id
@@ -194,7 +216,15 @@ class JobDetailView(APIView):
 class JobIssuesView(APIView):
     permission_classes = [IsAuthenticated]  # noqa: RUF012
 
-    @extend_schema(responses=ValidationIssuePageSerializer)
+    @extend_schema(
+        parameters=[
+            OpenApiParameter("page", int, description="One-based page; default 1."),
+            OpenApiParameter("page_size", int, description="Results per page; default 50, maximum 100."),
+            OpenApiParameter("issue_code", str, description="Filter by validation error code."),
+            OpenApiParameter("ordering", str, enum=["row_number", "-row_number", "created_at", "-created_at"], description="Sort field and direction."),
+        ],
+        responses={200: ValidationIssuePageSerializer, 400: OpenApiResponse(response=OpenApiTypes.OBJECT, description="Invalid query parameters; DRF field-error object."), 401: OpenApiResponse(response=OpenApiTypes.OBJECT, description="Authentication required."), 404: OpenApiResponse(response=OpenApiTypes.OBJECT, description="Job not found for this user.")},
+    )
     def get(self, request, job_id):
         job = get_object_or_404(IngestionJob.objects.filter(created_by=request.user), pk=job_id)
         return issues(request, job)
