@@ -6,8 +6,9 @@ authentication, the market-data ORM schema (ingestion jobs, files,
 exchanges/instruments, daily price records, validation issues, audit events,
 metric snapshots), a synthetic-data generator, the upload API with durable
 job records and owner-scoped status, and bounded CSV/JSON/XLSX ingestion
-processing. Daily returns and simple moving averages are calculated after
-ingestion and stored as `MetricSnapshot` rows.
+processing. Daily returns, simple moving averages, and 20-return rolling
+historical volatility are calculated after ingestion and stored as
+`MetricSnapshot` rows.
 
 ## Requirements
 
@@ -473,6 +474,34 @@ The SMA window defaults to five; callers of the pure calculator and persistence
 class can supply another positive window. Existing snapshots are not refreshed
 if canonical history is later corrected; a correction workflow is outside this
 milestone.
+
+### Rolling historical volatility (milestone 08)
+
+The ingestion completion hook stores annualized historical volatility from
+daily fractional returns. The default window is 20 valid observations, requires
+20 returns (21 valid closes), uses sample standard deviation (`ddof=1`), and
+annualizes by `sqrt(252)`. Values are annualized fractions; for example, `0.20`
+represents 20% annualized historical volatility. The window is per instrument
+and counts valid observations, so calendar gaps and missing/invalid closes do
+not consume a position. Constant returns produce zero volatility. Snapshots
+use `metric_type=rolling_volatility`, `lookback_days=20`, version `1`, and
+metadata that names the units, window rule, degrees of freedom, and
+annualization factor. Canonical history is streamed in bounded ORM batches,
+while only rows from the completed job receive snapshots. This metric describes
+historical variation and is not a forecast or guarantee.
+
+Volatility verification on 2026-10-21:
+
+- `venv\Scripts\python.exe -m pytest -q apps/marketdata/tests/test_metrics.py` - 16 passed against configured MySQL.
+- `venv\Scripts\python.exe manage.py check` - no issues.
+- `venv\Scripts\ruff.exe check apps/marketdata/ingestion/metrics.py apps/marketdata/jobs/ingestion/metrics.py apps/marketdata/tests/test_metrics.py` - all checks passed.
+
+The pure calculator tests cover sample standard deviation, annualization,
+insufficient data, constant returns, invalid closes, empty/single observations,
+duplicate dates, and state across chunks. The persistence test confirms full
+history context and current-job-only snapshots. Existing snapshots are not
+recomputed after historical corrections; a correction workflow remains out of
+scope.
 
 Worker logs include the job ID, source type, chunk and batch sizes, received/
 accepted/rejected counts, issue count, duration, and a failure category. Raw
