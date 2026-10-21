@@ -9,9 +9,6 @@ class AnalyticsPointSerializer(serializers.Serializer):
 
 
 class AnalyticsSeriesSerializer(serializers.Serializer):
-    count = serializers.IntegerField()
-    next = serializers.URLField(allow_null=True)
-    previous = serializers.URLField(allow_null=True)
     results = AnalyticsPointSerializer(many=True)
     symbol = serializers.CharField(allow_null=True)
     exchange = serializers.CharField(allow_null=True)
