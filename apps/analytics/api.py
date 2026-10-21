@@ -108,14 +108,22 @@ def _series(request, metric):
 def _build_series(request, metric, data, started):
     paginator = AnalyticsPagination()
     window = data.get("window", 5 if metric == "moving_average" else 20)
-    context = window if metric == "moving_average" else window + 1 if metric == "rolling_volatility" else 1 if metric == "daily_return" else 0
+    context = window if metric == "moving_average" else window + 1 if metric == "rolling_volatility" else 0
     records , instrument = _owned_records(request.user, data, context_days=context)
     frame = pd.DataFrame.from_records(records.values("trading_date", "close"))
     if not frame.empty:
         frame = frame.rename(columns={"trading_date": "timestamp"})
         frame.insert(0, "symbol", instrument.symbol)
     if metric == "daily_return":
-        values, _ = calculate_daily_returns(frame)
+        prior = PriceRecord.objects.filter(
+            instrument=instrument,
+            ingestion_job__created_by=request.user,
+            trading_date__lt=data["start_date"],
+        ).order_by("-trading_date", "-pk").values_list("close", flat=True).first()
+        values, _ = calculate_daily_returns(
+            frame,
+            {instrument.symbol: prior} if prior is not None else None,
+        )
         metric_type, units = "daily_return", "fraction"
     elif metric == "moving_average":
         values, _ = calculate_moving_average(frame, window=window)
@@ -136,10 +144,12 @@ def _build_series(request, metric, data, started):
         rows.reverse()
 
     page = paginator.paginate_queryset(rows, request)
-    response = paginator.get_paginated_response(data=page)
+    response = paginator.get_paginated_response(page)
     logger.info("analytics.request metric=%s instrument=%s range=%s..%s results=%s duration_ms=%.1f", metric_type, instrument.pk, data["start_date"], data["end_date"], len(rows), (time.monotonic()-started)*1000)
-    response.data = {}
     response.data.update({"symbol": instrument.symbol, "exchange": instrument.exchange.code, "start_date": data["start_date"], "end_date": data["end_date"], "metric": metric_type, "units": units})
+    response.data["results"] = page
+    for field in ("count", "next", "previous"):
+        response.data.pop(field, None)
     if metric in {"moving_average", "rolling_volatility"}:
         response.data["window"] = window
     if metric == "rolling_volatility":

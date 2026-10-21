@@ -972,19 +972,30 @@ for an instrument; the metric does not estimate future performance.
 
 The `apps/analytics/` Django app exposes authenticated, owner-scoped endpoints
 under `/api/v1/analytics/` for daily returns, moving averages, rolling
-volatility, drawdown, and raw-price summary aggregates. Analytics requests
-require `symbol`, `start_date`, and `end_date`; dates are inclusive and the
-range is limited to 3,660 days. Results are owner-scoped and paginated (50 by
-default, at most 100). Moving averages and volatility accept windows 5 and 20;
-volatility defaults to 20 returns, requires 21 closes, and reports annualized
-fractional units using sample standard deviation and 252 trading days. Returns,
-volatility, and drawdown are fractions; multiply by 100 for percentage display.
-Moving-average warm-up and preceding-close daily-return context contribute to
-calculations but are excluded from returned dates. Drawdown starts a new running
-peak at the requested period. `GET /api/v1/jobs/{id}/issues/` provides
+volatility, drawdown, and raw-price summary aggregates. All filters are
+optional. Without filters, series endpoints cover all price history owned by
+the authenticated user across all symbols; each result identifies its symbol
+and exchange. Date filters are inclusive. Results remain paginated, and metric
+calculation streams ORM rows in 1,000-row chunks. Explicit two-sided date
+ranges are limited to 3,660 days. Moving averages and volatility accept windows
+5 and 20; volatility defaults to 20 observations and reports annualized
+fractional units, sample standard deviation, and 252 annualization days.
+Series responses contain only `results` and metric metadata; they omit the
+pagination `count`, `next`, and `previous` fields. Results remain bounded to a
+page of at most 100 items, with no continuation URL exposed. The maximum drawdown series starts its
+running peak at the requested period. `GET /api/v1/jobs/{id}/issues/` provides
 owner-scoped paginated issues with optional `issue_code` filtering.
 The `issue_code` query parameter filters the model's `error_code` field; issue
 results expose that field as `error_code`.
+
+Series responses use the standard pagination envelope (`count`, `next`,
+`previous`, `results`) plus instrument, date-range, and metric metadata. Each
+result contains an ISO date and numeric value, or `null` while a complete
+calculation window is unavailable. Daily returns use the most recent earlier
+owned close as context; without one, the first requested observation is null.
+Moving average and volatility lookback rows contribute to calculations but are
+excluded from the requested output range. Drawdown uses the requested-period
+running peak, so its first valid close has a zero drawdown.
 
 Analytical series are computed on demand by calling the existing Pandas
 functions. The API filters canonical `PriceRecord` rows through the requesting
@@ -994,7 +1005,19 @@ reference, so using them could expose data computed from another user's
 records. The summary returns database-side close count,
 minimum, maximum, and average, labeled as raw-price aggregates.
 
-Verification (2026-10-21):
+Analytics series response fix verification (2026-10-21):
+
+- `venv\Scripts\python.exe -m pytest -q apps\analytics\tests\test_api.py` - blocked: 12 database-backed tests could not connect to configured MySQL (`127.0.0.1`, error 10013); 1 non-database test passed.
+- `venv\Scripts\python.exe manage.py check` - no issues.
+- `venv\Scripts\ruff.exe check apps\analytics\api.py apps\analytics\tests\test_api.py` - all checks passed.
+
+The response builder previously discarded the paginated computed results while
+retaining only metadata. Responses now include the computed `results` page.
+Daily returns also seed the existing calculation with the nearest earlier
+close, while moving-average and volatility context rows remain excluded from
+the output range.
+
+Earlier milestone 10 verification (2026-10-21):
 
 - `venv\Scripts\python.exe -m pytest -q apps/analytics/tests/test_api.py apps/marketdata/tests/test_metrics.py` - 28 passed against configured MySQL.
 - `venv\Scripts\python.exe manage.py check` - no issues.
