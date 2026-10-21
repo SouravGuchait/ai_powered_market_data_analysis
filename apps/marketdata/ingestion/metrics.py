@@ -3,6 +3,7 @@
 from collections import deque
 from collections.abc import Iterable
 from decimal import Decimal
+from math import sqrt
 from typing import Protocol
 
 import pandas as pd
@@ -111,3 +112,60 @@ def iter_moving_averages(
     for chunk in chunks:
         averages, previous = calculate_moving_average(chunk, window, previous)
         yield chunk, averages
+
+
+def calculate_rolling_volatility(
+    frame: pd.DataFrame,
+    window: int = 20,
+    previous_state: dict[str, tuple[Decimal | None, list[float]]] | None = None,
+) -> tuple[pd.Series, dict[str, tuple[Decimal | None, list[float]]]]:
+    """Return annualized sample volatility from full valid-return windows.
+
+    State holds each symbol's last valid close and up to ``window - 1`` prior
+    fractional returns, allowing callers to continue across chunks.
+    """
+    if window < 2:
+        raise ValueError("window must be at least 2")
+    state = {
+        symbol: (close, deque(returns[-(window - 1) :], maxlen=window))
+        for symbol, (close, returns) in (previous_state or {}).items()
+    }
+    values = pd.Series(float("nan"), index=frame.index, dtype="float64")
+    if frame.empty:
+        return values, {
+            symbol: (close, list(returns)) for symbol, (close, returns) in state.items()
+        }
+
+    ordered = frame.assign(_position=range(len(frame))).sort_values(
+        ["symbol", "timestamp"], kind="stable"
+    )
+    if ordered.duplicated(["symbol", "timestamp"]).any():
+        raise ValueError("duplicate symbol/timestamp observations")
+    for symbol_value, close_value, position in ordered[
+        ["symbol", "close", "_position"]
+    ].itertuples(index=False, name=None):
+        symbol = str(symbol_value)
+        close = _positive_decimal(close_value)
+        if close is None:
+            continue
+        prior, returns = state.setdefault(symbol, (None, deque(maxlen=window)))
+        if prior is not None and prior > 0:
+            returns.append(float((close - prior) / prior))
+            if len(returns) == window:
+                mean = sum(returns) / window
+                daily_sample_std = sqrt(sum((value - mean) ** 2 for value in returns) / (window - 1))
+                values.iloc[int(position)] = daily_sample_std * sqrt(252)
+        state[symbol] = (close, returns)
+    return values, {
+        symbol: (close, list(returns)) for symbol, (close, returns) in state.items()
+    }
+
+
+def iter_rolling_volatility(
+    chunks: Iterable[pd.DataFrame], window: int = 20
+) -> Iterable[tuple[pd.DataFrame, pd.Series]]:
+    """Yield annualized volatility with bounded state across input chunks."""
+    previous: dict[str, tuple[Decimal | None, list[float]]] = {}
+    for chunk in chunks:
+        volatility, previous = calculate_rolling_volatility(chunk, window, previous)
+        yield chunk, volatility

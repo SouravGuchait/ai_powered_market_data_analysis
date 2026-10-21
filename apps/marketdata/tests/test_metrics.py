@@ -6,12 +6,15 @@ import pytest
 from apps.marketdata.ingestion.metrics import (
     calculate_daily_returns,
     calculate_moving_average,
+    calculate_rolling_volatility,
     iter_daily_returns,
     iter_moving_averages,
+    iter_rolling_volatility,
 )
 from apps.marketdata.jobs.ingestion.metrics import (
     DailyReturnCalculator,
     MovingAverageCalculator,
+    RollingVolatilityCalculator,
 )
 from apps.marketdata.models import (
     Exchange,
@@ -227,3 +230,106 @@ def test_calculator_persists_job_returns_using_prior_history(instrument, job):
         metric_type=MetricSnapshot.MetricType.DAILY_RETURN,
     )
     assert snapshot.value == Decimal("0.10000000")
+
+
+def test_rolling_volatility_uses_sample_std_and_annualizes():
+    frame = pd.DataFrame(
+        [("A", f"2026-01-0{day}", close) for day, close in
+         ((1, "100"), (2, "110"), (3, "100"), (4, "120"))],
+        columns=["symbol", "timestamp", "close"],
+    )
+    values, _ = calculate_rolling_volatility(frame, window=3)
+    expected = pd.Series([0.1, -1 / 11, 0.2]).std(ddof=1) * (252**0.5)
+    assert pd.isna(values.iloc[:3]).all()
+    assert values.iloc[3] == pytest.approx(expected)
+
+
+def test_rolling_volatility_state_is_independent_per_symbol_and_ignores_zero_prior():
+    frame = pd.DataFrame(
+        [("A", "1", "10"), ("B", "1", "20"), ("A", "2", "11"),
+         ("B", "2", "18"), ("A", "3", "12.1"), ("B", "3", "16.2")],
+        columns=["symbol", "timestamp", "close"],
+    )
+    values, _ = calculate_rolling_volatility(frame, window=2)
+    assert pd.isna(values.iloc[:4]).all()
+    assert values.iloc[4] == pytest.approx(0.0)
+    assert values.iloc[5] == pytest.approx(0.0, abs=1e-7)
+    zero_prior = pd.DataFrame(
+        [("A", "4", "13")], columns=["symbol", "timestamp", "close"]
+    )
+    result, _ = calculate_rolling_volatility(
+        zero_prior, window=2, previous_state={"A": (Decimal(0), [])}
+    )
+    assert result.isna().all()
+
+
+def test_rolling_volatility_constant_returns_and_chunk_boundaries():
+    chunks = [
+        pd.DataFrame(
+            [("A", "1", "100"), ("A", "2", "110")],
+            columns=["symbol", "timestamp", "close"],
+        ),
+        pd.DataFrame(
+            [("A", "3", "121"), ("A", "4", "133.1")],
+            columns=["symbol", "timestamp", "close"],
+        ),
+    ]
+    results = list(iter_rolling_volatility(chunks, window=2))
+    assert results[0][1].isna().all()
+    assert results[1][1].iloc[0] == pytest.approx(0.0)
+    assert results[1][1].iloc[1] == pytest.approx(0.0, abs=1e-7)
+    whole, _ = calculate_rolling_volatility(pd.concat(chunks), window=2)
+    assert pd.concat([item[1] for item in results]).tolist() == pytest.approx(
+        whole.tolist(), nan_ok=True
+    )
+
+
+def test_rolling_volatility_skips_invalid_closes_and_handles_empty_and_duplicates():
+    empty = pd.DataFrame(columns=["symbol", "timestamp", "close"])
+    values, state = calculate_rolling_volatility(empty, window=2)
+    assert values.empty and state == {}
+    frame = pd.DataFrame(
+        [("A", "1", "100"), ("A", "2", None), ("A", "3", "110")],
+        columns=["symbol", "timestamp", "close"],
+    )
+    values, _ = calculate_rolling_volatility(frame, window=2)
+    assert values.isna().all()
+    one, _ = calculate_rolling_volatility(frame.iloc[:1], window=2)
+    assert one.isna().all()
+    repeated = pd.concat([frame, frame.iloc[[0]]], ignore_index=True)
+    with pytest.raises(ValueError, match="duplicate"):
+        calculate_rolling_volatility(repeated, window=2)
+    with pytest.raises(ValueError, match="at least 2"):
+        calculate_rolling_volatility(frame, window=1)
+
+
+@pytest.mark.django_db
+def test_rolling_volatility_persists_full_history_but_only_current_job_rows(instrument, job):
+    for day, close in enumerate((100, 110, 100, 120), start=1):
+        PriceRecord.objects.create(
+            instrument=instrument, ingestion_job=job,
+            trading_date=f"2024-01-{day:02d}", open=close, high=close,
+            low=close, close=close, volume=0,
+        )
+    current_job = IngestionJob.objects.create(source_type="csv")
+    for day, close in ((5, 130), (6, 125)):
+        PriceRecord.objects.create(
+            instrument=instrument, ingestion_job=current_job,
+            trading_date=f"2024-01-{day:02d}", open=close, high=close,
+            low=close, close=close, volume=0,
+        )
+    RollingVolatilityCalculator(window=3).on_job_completed(job=current_job)
+    snapshots = MetricSnapshot.objects.filter(
+        instrument=instrument,
+        metric_type=MetricSnapshot.MetricType.ROLLING_VOLATILITY,
+    ).order_by("as_of_date")
+    assert [day.isoformat() for day in snapshots.values_list("as_of_date", flat=True)] == [
+        "2024-01-05", "2024-01-06"
+    ]
+    assert snapshots.first().lookback_days == 3
+    assert snapshots.first().metadata == {
+        "units": "annualized_fraction",
+        "window_type": "valid_observations",
+        "return_ddof": 1,
+        "annualization_days": 252,
+    }
